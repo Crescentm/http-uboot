@@ -13,6 +13,40 @@ typedef void (*net_lwip_udp_recv_fn)(void *arg, struct udp_pcb *pcb,
 				     struct pbuf *p, const ip_addr_t *addr,
 				     u16_t port);
 typedef void (*net_lwip_poll_fn)(void *arg);
+struct udevice;
+
+/**
+ * enum net_lwip_addr_mode - IPv4 requirements of a runtime client
+ * @NET_LWIP_ADDR_ENV_STRICT: Use environment addressing and require it to
+ *	remain stable while the client is attached
+ * @NET_LWIP_ADDR_ENV_FLEXIBLE: Use environment addressing, but permit another
+ *	client to temporarily change or clear the shared interface configuration
+ * @NET_LWIP_ADDR_NONE: Temporarily own the shared interface configuration and
+ *	start without an IPv4 address. This mode can coexist only with flexible
+ *	clients
+ */
+enum net_lwip_addr_mode {
+	NET_LWIP_ADDR_ENV_STRICT,
+	NET_LWIP_ADDR_ENV_FLEXIBLE,
+	NET_LWIP_ADDR_NONE,
+};
+
+/**
+ * struct net_lwip_ctx - Attachment to the shared lwIP runtime
+ * @dev: Ethernet device used by the runtime
+ * @netif: Shared lwIP network interface
+ * @addr_mode: Address mode requested by this client
+ *
+ * Clients must zero-initialize this structure before passing it to
+ * net_lwip_start(). Multiple active clients share @dev and @netif. A client
+ * must remove its callbacks and protocol control blocks before calling
+ * net_lwip_stop().
+ */
+struct net_lwip_ctx {
+	struct udevice *dev;
+	struct netif *netif;
+	enum net_lwip_addr_mode addr_mode;
+};
 
 /* HTTPS authentication mode */
 enum auth_mode {
@@ -43,14 +77,14 @@ int eth_init_state_only(void); /* Set active state */
 
 int net_lwip_dns_init(void);
 int net_lwip_eth_start(void);
-void net_lwip_eth_stop(void);
 void net_lwip_set_recovery_dhcp_hook(net_lwip_udp_recv_fn recv, void *arg);
 void net_lwip_set_recovery_poll_hook(net_lwip_poll_fn poll, void *arg);
-struct netif *net_lwip_new_netif(struct udevice *udev);
-struct netif *net_lwip_new_netif_noip(struct udevice *udev);
-void net_lwip_remove_netif(struct netif *netif);
-struct netif *net_lwip_get_netif(void);
-int net_lwip_rx(struct udevice *udev, struct netif *netif);
+int net_lwip_start(struct net_lwip_ctx *ctx,
+		   enum net_lwip_addr_mode addr_mode);
+void net_lwip_stop(struct net_lwip_ctx *ctx);
+int net_lwip_restart(struct net_lwip_ctx *ctx);
+int net_lwip_refresh(struct net_lwip_ctx *ctx);
+int net_lwip_poll(void);
 int net_lwip_dns_resolve(char *name_or_ip, ip_addr_t *ip);
 
 /**

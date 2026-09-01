@@ -5562,11 +5562,7 @@ static void recovery_release_target(struct recovery_target *target)
 
 static void recovery_service_runtime(struct recovery_status_led_ctrl *status_leds)
 {
-	struct udevice *udev = eth_get_current();
-	struct netif *netif = net_lwip_get_netif();
-
-	if (udev && eth_is_active(udev) && netif)
-		net_lwip_rx(udev, netif);
+	net_lwip_poll();
 	if (status_leds)
 		recovery_status_led_poll(status_leds);
 	WATCHDOG_RESET();
@@ -8552,14 +8548,14 @@ static int flash_image(struct recovery_status_led_ctrl *status_leds)
 
 int run_http_recovery(void)
 {
-	struct udevice *udev = NULL;
+	struct net_lwip_ctx net = {};
 	struct netif *netif = NULL;
 	struct recovery_led_ctrl leds;
 	struct recovery_status_led_ctrl status_leds;
 	struct recovery_dhcp_server dhcp;
 	bool use_status_leds = false;
 	bool use_link_leds = false;
-	bool eth_started = false;
+	bool net_started = false;
 	const char *old_allow_no_link;
 	char *saved_allow_no_link = NULL;
 	ulong timeout_ms;
@@ -8621,39 +8617,21 @@ int run_http_recovery(void)
 
 	recovery_debug_printf("HTTP recovery: starting Ethernet\n");
 	recovery_watchdog_poll();
-	rc = net_lwip_eth_start();
+	/*
+	 * Attach to the shared lwIP runtime.  The first client starts the
+	 * current Ethernet device (eth_start_udev() also repairs a device left
+	 * passive by the stock bootm / chainloader handoff) and creates the
+	 * netif.  Other clients such as netconsole may share it.
+	 */
+	rc = net_lwip_start(&net, NET_LWIP_ADDR_ENV_STRICT);
 	if (rc < 0) {
 		printf("Failed to start Ethernet: %d\n", rc);
 		goto out;
 	}
-	eth_started = true;
-	recovery_watchdog_poll();
-
-	/*
-	 * A previous boot stage can leave the Ethernet device enumerated but
-	 * without a current-device pointer (or in the passive state).  The
-	 * normal eth_init() path usually repairs this, but the stock bootm /
-	 * chainloader handoff does not guarantee it.  Resolve the default device
-	 * and start it once more before rejecting recovery networking.
-	 */
-	udev = eth_get_current();
-	if (!udev)
-		udev = eth_get_dev();
-	if (udev && !eth_is_active(udev)) {
-		rc = eth_start_udev(udev);
-		if (rc < 0)
-			recovery_debug_printf("HTTP recovery: unable to restart Ethernet (%d)\n",
-					      rc);
-	}
-	if (!udev || !eth_is_active(udev)) {
+	net_started = true;
+	netif = net.netif;
+	if (!eth_is_active(net.dev)) {
 		printf("No active net device\n");
-		rc = -ENODEV;
-		goto out;
-	}
-
-	recovery_debug_printf("HTTP recovery: creating lwIP netif\n");
-	netif = net_lwip_new_netif(udev);
-	if (!netif) {
 		rc = -ENODEV;
 		goto out;
 	}
@@ -8683,8 +8661,8 @@ int run_http_recovery(void)
 				break;
 			}
 		}
-		/* net_lwip_rx() already runs sys_check_timeouts(). */
-		net_lwip_rx(udev, netif);
+		/* net_lwip_poll() already runs sys_check_timeouts(). */
+		net_lwip_poll();
 		recovery_qwrt_button_poll();
 		if (use_status_leds)
 			recovery_status_led_poll(&status_leds);
@@ -8763,10 +8741,8 @@ out:
 	recovery_restore_reset();
 	recovery_dhcp_server_stop(&dhcp);
 	net_lwip_set_recovery_dhcp_hook(NULL, NULL);
-	if (netif)
-		net_lwip_remove_netif(netif);
-	if (eth_started)
-		net_lwip_eth_stop();
+	if (net_started)
+		net_lwip_stop(&net);
 	recovery_status_led_stop(&status_leds);
 	recovery_status_led_release(&status_leds);
 	recovery_led_ctrl_free(&leds);
