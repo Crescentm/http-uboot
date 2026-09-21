@@ -895,7 +895,7 @@ function inspectSelectedFile(){
     var matches=[false,false];
     var complete=0;
     for(let i=0;i<pads.length;i++){
-      var magicReader=new FileReader();
+      let magicReader=new FileReader();
       magicReader.addEventListener("load",function(){
         if(epoch!==fileInspection||file!==selectedFile)return;
         var magic=new Uint8Array(magicReader.result||new ArrayBuffer(0));
