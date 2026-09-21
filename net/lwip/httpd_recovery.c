@@ -489,6 +489,10 @@ static enum upload_target prepare_target = TARGET_FIRMWARE;
 static size_t prepare_size;
 static enum recovery_stream_format current_stream_format = RECOVERY_STREAM_RAW;
 static enum recovery_stream_format prepare_stream_format = RECOVERY_STREAM_RAW;
+static enum recovery_sbe1v1k_layout current_stream_profile =
+	RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
+static enum recovery_sbe1v1k_layout prepare_stream_profile =
+	RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
 static enum recovery_sbe1v1k_layout current_repartition_layout =
 	RECOVERY_SBE1V1K_LAYOUT_LARGE;
 static enum recovery_sbe1v1k_layout active_sbe1v1k_layout =
@@ -2892,6 +2896,7 @@ struct recovery_mmc_stream {
 	int error;
 	enum upload_target target;
 	enum recovery_stream_format format;
+	enum recovery_sbe1v1k_layout profile;
 	size_t total_expected;
 	bool tar_control_active;
 	bool tar_seen_control;
@@ -2963,7 +2968,8 @@ static int recovery_mmc_stream_add_part(const char *spec, size_t expected)
 }
 
 static int recovery_mmc_stream_prepare(enum upload_target target, size_t size,
-				       enum recovery_stream_format format)
+				       enum recovery_stream_format format,
+				       enum recovery_sbe1v1k_layout profile)
 {
 	const char *kernel_part = env_get("recovery_part_kernel") ?: "0#kernel";
 	const char *rootfs_part = env_get("recovery_part_rootfs") ?: "0#rootfs";
@@ -2992,6 +2998,7 @@ static int recovery_mmc_stream_prepare(enum upload_target target, size_t size,
 	recovery_stream_completed = false;
 	recovery_stream.target = target;
 	recovery_stream.format = format;
+	recovery_stream.profile = profile;
 	recovery_stream.total_expected = size;
 
 	if (target == TARGET_FIRMWARE) {
@@ -7523,6 +7530,55 @@ static int recovery_stream_format_from_uri(
 	return -EINVAL;
 }
 
+static int recovery_stream_profile_from_uri(
+	const char *uri, enum recovery_sbe1v1k_layout *profile)
+{
+	const char *value = strstr(uri, "profile=");
+
+	*profile = RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
+	if (!value)
+		return -ENOENT;
+	value += strlen("profile=");
+	if (!strncmp(value, "mainline", 8) &&
+	    (value[8] == '\0' || value[8] == '&')) {
+		*profile = RECOVERY_SBE1V1K_LAYOUT_MAINLINE;
+		return 0;
+	}
+	if (!strncmp(value, "large", 5) &&
+	    (value[5] == '\0' || value[5] == '&')) {
+		*profile = RECOVERY_SBE1V1K_LAYOUT_LARGE;
+		return 0;
+	}
+	if (!strncmp(value, "qwrt", 4) &&
+	    (value[4] == '\0' || value[4] == '&')) {
+		*profile = RECOVERY_SBE1V1K_LAYOUT_QWRT;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int recovery_stream_board_from_uri(const char *uri, char *board,
+						 size_t board_size)
+{
+	const char *value = strstr(uri, "board=");
+	const char *end;
+	size_t length;
+
+	if (!value || !board || board_size < 2)
+		return -EINVAL;
+	value += strlen("board=");
+	end = value;
+	while (*end && *end != '&')
+		end++;
+	length = end - value;
+	if (!length || length >= board_size)
+		return -EINVAL;
+	memcpy(board, value, length);
+	board[length] = '\0';
+	return 0;
+}
+
 static int recovery_layout_from_uri(const char *uri,
 				    enum recovery_sbe1v1k_layout *layout)
 {
@@ -7678,6 +7734,8 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 {
 	bool stream_enabled;
 	const char *tname;
+	char stream_board[96];
+	int ret;
 
 	(void)http_request;
 	(void)http_request_len;
@@ -7747,6 +7805,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 	recv_total = 0;
 	current_force_recreate = false;
 	current_prepare_only = false;
+	current_stream_profile = RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
 
 	if (current_restore_prepare) {
 		if (!recovery_backend_is_mmc() || content_len <= 0 ||
@@ -7834,6 +7893,48 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		strlcpy(response_uri, "/fail.html", response_uri_len);
 		return ERR_ARG;
 	}
+	if (current_target == TARGET_FIRMWARE &&
+	    current_stream_format == RECOVERY_STREAM_TAR &&
+	    recovery_board_is_sbe1v1k()) {
+		ret = recovery_stream_profile_from_uri(uri,
+						       &current_stream_profile);
+		if (ret) {
+			prog_phase = -1;
+			printf("httpd: sysupgrade profile is required before destructive erase\n");
+			strlcpy(response_uri, "/fail.html", response_uri_len);
+			return ERR_ARG;
+		}
+		ret = recovery_stream_board_from_uri(uri, stream_board,
+						    sizeof(stream_board));
+		if (ret) {
+			prog_phase = -1;
+			printf("httpd: sysupgrade board identity is required before destructive erase\n");
+			strlcpy(response_uri, "/fail.html", response_uri_len);
+			return ERR_ARG;
+		}
+		{
+			enum recovery_sbe1v1k_layout inferred_profile;
+
+			ret = recovery_sbe1v1k_tar_layout(stream_board, NULL,
+							   &inferred_profile);
+			if (ret || inferred_profile != current_stream_profile) {
+				prog_phase = -1;
+				printf("httpd: sysupgrade board '%s' does not match profile '%s'\n",
+				       stream_board,
+				       recovery_sbe1v1k_layout_name(current_stream_profile));
+				strlcpy(response_uri, "/fail.html", response_uri_len);
+				return ERR_USE;
+			}
+		}
+		if (current_stream_profile != active_sbe1v1k_layout) {
+			prog_phase = -1;
+			printf("httpd: sysupgrade profile '%s' does not match active '%s' profile\n",
+			       recovery_sbe1v1k_layout_name(current_stream_profile),
+			       recovery_sbe1v1k_layout_name(active_sbe1v1k_layout));
+			strlcpy(response_uri, "/fail.html", response_uri_len);
+			return ERR_USE;
+		}
+	}
 	if (current_target == TARGET_REPARTITION &&
 	    recovery_layout_from_uri(uri, &current_repartition_layout)) {
 		prog_phase = -1;
@@ -7899,6 +8000,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		if (!recovery_stream.active || !recovery_stream.prepared ||
 		    recovery_stream.target != current_target ||
 		    recovery_stream.format != current_stream_format ||
+		    recovery_stream.profile != current_stream_profile ||
 		    recovery_stream.total_expected != recv_total) {
 			recovery_mmc_stream_reset();
 			recovery_stream_completed = false;
@@ -8107,6 +8209,7 @@ void httpd_post_finished(void *connection, char *response_uri, u16_t response_ur
 				prepare_target = current_target;
 				prepare_size = requested_size;
 				prepare_stream_format = current_stream_format;
+				prepare_stream_profile = current_stream_profile;
 				/* -1 reserves the operation until the delayed callback fires. */
 				prepare_request = -1;
 				prog_phase = 0;
@@ -8420,6 +8523,7 @@ int run_http_recovery(void)
 	restore_prepare_id[0] = '\0';
 	restore_prepare_size = 0;
 	prepare_size = 0;
+	prepare_stream_profile = RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
 	current_prepare_only = false;
 	current_restore_prepare = false;
 	current_restore_chunk = false;
@@ -8526,7 +8630,8 @@ int run_http_recovery(void)
 					      (ulong)prepare_size);
 			rc = recovery_mmc_stream_prepare(prepare_target,
 							 prepare_size,
-							 prepare_stream_format);
+							 prepare_stream_format,
+							 prepare_stream_profile);
 			if (rc) {
 				prog_phase = -1;
 				printf("Destructive stream preparation failed: %d\n",

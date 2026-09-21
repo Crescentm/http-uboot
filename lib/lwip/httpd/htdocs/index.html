@@ -606,7 +606,10 @@ var activeView="firmware";
 var selectedFile=null;
 var selectedFileFormat="";
 var selectedRawLayout="";
+var selectedTarBoard="";
+var selectedTarLayout="";
 var selectedUploadFormat="raw";
+var selectedUploadProfile="";
 var fileInspection=0;
 var activeDiskLayout="unknown";
 var firmwareKernelPad=32*1024*1024;
@@ -619,6 +622,7 @@ var pollEpoch=0;
 var pollOutcome=0;
 var countdownStarted=false;
 var uploadStarted=false;
+var operationFailed=false;
 var restoreFile=null;
 var restoreOffset=0;
 var restoreInProgress=false;
@@ -779,6 +783,75 @@ function rawLayoutForProfile(layout){
   return layout==="qwrt"?"mainline":layout;
 }
 
+function tarText(bytes){
+  var text="";
+  for(var i=0;i<bytes.length;i++)text+=String.fromCharCode(bytes[i]);
+  return text;
+}
+
+function tarField(bytes,offset,length){
+  var text="";
+  for(var i=0;i<length&&bytes[offset+i];i++)text+=String.fromCharCode(bytes[offset+i]);
+  return text;
+}
+
+function tarOctal(bytes,offset,length){
+  var value=tarField(bytes,offset,length).trim();
+  return /^[0-7]+$/.test(value)?parseInt(value,8):-1;
+}
+
+function inspectTarControl(file,epoch){
+  var reader=new FileReader();
+  var limit=Math.min(file.size,128*1024);
+  reader.addEventListener("load",function(){
+    if(epoch!==fileInspection||file!==selectedFile)return;
+    var bytes=new Uint8Array(reader.result||new ArrayBuffer(0));
+    var text="";
+    for(var off=0;off+512<=bytes.length;){
+      var name=tarField(bytes,off,100);
+      var size=tarOctal(bytes,off+124,12);
+      if(size<0)break;
+      if(name.split("/").pop().toUpperCase()==="CONTROL"&&off+512+size<=bytes.length){
+        text=tarText(bytes.slice(off+512,off+512+size));
+        break;
+      }
+      off+=512+Math.ceil(size/512)*512;
+    }
+    var board=text.match(/(?:^|\n)BOARD=([A-Za-z0-9,_.:-]+)(?:\r?\n|$)/);
+    var layout=text.match(/(?:^|\n)SBE1V1K_LAYOUT=(mainline|large|qwrt)(?:\r?\n|$)/);
+    selectedTarBoard=board?board[1]:"";
+    selectedTarLayout=layout?layout[1]:"";
+    selectedFileFormat="tar";
+    validateFile();
+  });
+  reader.addEventListener("error",function(){
+    if(epoch!==fileInspection||file!==selectedFile)return;
+    selectedTarBoard="";
+    selectedTarLayout="";
+    selectedFileFormat="tar";
+    validateFile();
+  });
+  reader.readAsArrayBuffer(file.slice(0,limit));
+}
+
+function effectiveTarLayout(){
+  if(selectedTarLayout)return selectedTarLayout;
+  if(selectedTarBoard==="qcom,ipq9574-ap-al02-c4")return"mainline";
+  if(selectedTarBoard==="askey_sbe1v1k"||
+     selectedTarBoard==="askey,sbe1v1k")return"large";
+  if(selectedTarBoard==="spectrum_sbe1v1k"||
+     selectedTarBoard==="spectrum,sbe1v1k")return activeDiskLayout;
+  return"";
+}
+
+function selectedProfileQuery(){
+  var query="";
+  if(selectedUploadProfile)query+="&profile="+encodeURIComponent(selectedUploadProfile);
+  /* CONTROL board names are restricted to URI-safe punctuation. */
+  if(selectedTarBoard)query+="&board="+selectedTarBoard;
+  return query;
+}
+
 function setQwrtVisibility(unlocked){
   qwrtUnlocked=!!unlocked;
   var option=layoutSelect.querySelector('option[value="qwrt"]');
@@ -880,6 +953,9 @@ function updateLayoutSelection(){
 function inspectSelectedFile(){
   var file=selectedFile;
   var epoch=++fileInspection;
+  operationFailed=false;
+  selectedTarBoard="";
+  selectedTarLayout="";
   if(!file){selectedFileFormat="";selectedRawLayout="";validateFile();return}
   selectedFileFormat="pending";
   selectedRawLayout="";
@@ -890,7 +966,12 @@ function inspectSelectedFile(){
     var bytes=new Uint8Array(reader.result||new ArrayBuffer(0));
     var fit=bytes.length>=4&&bytes[0]===0xd0&&bytes[1]===0x0d&&bytes[2]===0xfe&&bytes[3]===0xed;
     var tar=bytes.length>=262&&bytes[257]===0x75&&bytes[258]===0x73&&bytes[259]===0x74&&bytes[260]===0x61&&bytes[261]===0x72;
-    if(!fit){selectedFileFormat=tar?"tar":"unknown";validateFile();return}
+    if(!fit){
+      if(tar){inspectTarControl(file,epoch);return}
+      selectedFileFormat="unknown";
+      validateFile();
+      return;
+    }
     var pads=[7*1024*1024,32*1024*1024];
     var matches=[false,false];
     var complete=0;
@@ -928,6 +1009,13 @@ function fileError(){
   if(selectedFileFormat==="pending")return"";
   if(activeView==="firmware"&&firmwareLocked)return"Firmware upload is locked until a verified eMMC layout migration completes.";
   if(selectedFileFormat==="unknown")return"Image must be a FIT-based raw image or an OpenWrt sysupgrade tar.";
+  if(activeView==="firmware"&&selectedFileFormat==="tar"){
+    var tarLayout=effectiveTarLayout();
+    if(layoutProfiles[activeDiskLayout]&&tarLayout&&
+       tarLayout!==activeDiskLayout&&
+       !(activeDiskLayout==="qwrt"&&tarLayout==="mainline"))
+      return"This sysupgrade image targets the "+tarLayout+" layout, not the current "+activeDiskLayout+" layout.";
+  }
   if(activeView==="firmware"&&selectedFileFormat==="raw"&&selectedRawLayout==="unknown")return"Raw firmware has no SquashFS at a supported layout boundary.";
   if(activeView==="firmware"&&selectedFileFormat==="raw"&&layoutProfiles[activeDiskLayout]&&selectedRawLayout!==rawLayoutForProfile(activeDiskLayout))return"Raw firmware is for the "+selectedRawLayout+" layout, not the current "+activeDiskLayout+" layout.";
   if(activeView==="firmware"&&selectedFileFormat==="raw"&&selectedFile.size<=firmwareKernelPad)return"Raw firmware must be larger than the "+formatBytes(firmwareKernelPad)+" kernel area.";
@@ -953,6 +1041,7 @@ function setProgress(name,pct,rowState){
 }
 
 function resetProgress(message){
+  operationFailed=false;
   setProgress("upload",0,"");
   setProgress("erase",0,"");
   setProgress("write",0,"");
@@ -992,7 +1081,7 @@ function validateFile(){
   if(!busy&&activeView!=="layout"){
     if(error)setState("Invalid","error",error);
     else if(selectedFileFormat==="pending")setState("Inspecting","idle","Reading the image header.");
-    else if(selectedFile)setState("Ready","success","Ready to upload.");
+    else if(selectedFile&&!operationFailed)setState("Ready","success","Ready to upload.");
   }
 }
 
@@ -1194,6 +1283,7 @@ function updateServerProgress(data){
 }
 
 function failRestore(label,message){
+  operationFailed=true;
   restoreChunkActive=false;
   restoreInProgress=false;
   restoreConfirmInput.value="";
@@ -1226,7 +1316,9 @@ function sendRestoreChunk(){
   });
   xhr.addEventListener("load",function(){
     restoreChunkActive=false;
-    if(xhr.status<200||xhr.status>=300){
+    if(xhr.status<200||xhr.status>=300||
+       (xhr.responseURL&&xhr.responseURL.indexOf("/fail.html")>=0)){
+      operationFailed=true;
       failRestore("Rejected","The server rejected a restore chunk. Review the serial console before retrying.");
       return;
     }
@@ -1260,7 +1352,9 @@ function restorePartition(){
 
   var xhr=new XMLHttpRequest();
   xhr.addEventListener("load",function(){
-    if(xhr.status<200||xhr.status>=300){
+    if(xhr.status<200||xhr.status>=300||
+       (xhr.responseURL&&xhr.responseURL.indexOf("/fail.html")>=0)){
+      operationFailed=true;
       failRestore("Rejected","The server rejected the restore confirmation. Review the serial console.");
       return;
     }
@@ -1342,6 +1436,7 @@ async function pollStatus(epoch){
     }else if(data.error){
       if(restoreInProgress)failRestore("Failed","Partition restore failed. Review the serial console before retrying.");
       else{
+        operationFailed=true;
         pollOutcome=-1;
         stopPolling();
         setState("Failed","error","Operation failed. Review the serial console before retrying.");
@@ -1371,7 +1466,9 @@ function sendUpload(){
     if(!complete)setState("Streaming","working","Writing upload data directly to eMMC.");
   });
   xhr.addEventListener("load",function(){
-    if(xhr.status<200||xhr.status>=300){
+    if(xhr.status<200||xhr.status>=300||
+       (xhr.responseURL&&xhr.responseURL.indexOf("/fail.html")>=0)){
+      operationFailed=true;
       pollOutcome=-1;
       stopPolling();
       setState("Rejected","error","The server rejected the operation. Review the serial console.");
@@ -1383,12 +1480,13 @@ function sendUpload(){
     pollStatus(pollEpoch);
   });
   xhr.addEventListener("error",function(){
+    operationFailed=true;
     pollOutcome=-1;
     stopPolling();
     setState("Network error","error","The destructive upload was interrupted. The target may not be bootable.");
     setBusy(false);
   });
-  xhr.open("POST","/upload/"+activeView+"?format="+selectedUploadFormat,true);
+  xhr.open("POST","/upload/"+activeView+"?format="+selectedUploadFormat+selectedProfileQuery(),true);
   xhr.setRequestHeader("Content-Type","application/octet-stream");
   xhr.send(selectedFile);
 }
@@ -1396,6 +1494,12 @@ function sendUpload(){
 function upload(){
   if(!selectedFile||fileError()||activeView==="layout")return;
   selectedUploadFormat=activeView==="firmware"&&selectedFileFormat==="tar"?"tar":"raw";
+  selectedUploadProfile=selectedUploadFormat==="tar"?effectiveTarLayout():"";
+  if(activeView==="firmware"&&selectedUploadFormat==="tar"&&!selectedUploadProfile){
+    operationFailed=true;
+    setState("Rejected","error","The firmware layout could not be determined before erase.");
+    return;
+  }
   setBusy(true);
   resetProgress("Preparing destructive upload.");
   pollEpoch++;
@@ -1404,7 +1508,9 @@ function upload(){
 
   var xhr=new XMLHttpRequest();
   xhr.addEventListener("load",function(){
-    if(xhr.status<200||xhr.status>=300){
+    if(xhr.status<200||xhr.status>=300||
+       (xhr.responseURL&&xhr.responseURL.indexOf("/fail.html")>=0)){
+      operationFailed=true;
       pollOutcome=-1;
       stopPolling();
       setState("Rejected","error","The server rejected the erase request. Review the serial console.");
@@ -1416,12 +1522,13 @@ function upload(){
     pollStatus(pollEpoch);
   });
   xhr.addEventListener("error",function(){
+    operationFailed=true;
     pollOutcome=-1;
     stopPolling();
     setState("Network error","error","The erase request was interrupted before streaming began.");
     setBusy(false);
   });
-  xhr.open("POST","/action/prepare/"+activeView+"?format="+selectedUploadFormat,true);
+  xhr.open("POST","/action/prepare/"+activeView+"?format="+selectedUploadFormat+selectedProfileQuery(),true);
   xhr.setRequestHeader("Content-Type","text/plain");
   xhr.send(String(selectedFile.size));
 }
@@ -1437,6 +1544,7 @@ function repartition(){
   var xhr=new XMLHttpRequest();
   xhr.addEventListener("load",function(){
     if(xhr.status<200||xhr.status>=300){
+      operationFailed=true;
       pollOutcome=-1;
       stopPolling();
       setState("Rejected","error","Migration was rejected. Review the serial console.");
@@ -1447,6 +1555,7 @@ function repartition(){
     pollStatus(pollEpoch);
   });
   xhr.addEventListener("error",function(){
+    operationFailed=true;
     pollOutcome=-1;
     stopPolling();
     setState("Network error","error","Migration request was interrupted. Review the serial console.");
