@@ -7787,7 +7787,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		*post_auto_wnd = 0;
 	if (post_connection) {
 		printf("httpd: rejecting concurrent POST connection\n");
-		strlcpy(response_uri, "/fail.html", response_uri_len);
+		strlcpy(response_uri, "/400.html", response_uri_len);
 		return ERR_USE;
 	}
 	post_ok = 0;
@@ -7806,7 +7806,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 			    &current_restore_size)) {
 			prog_phase = -1;
 			printf("httpd: invalid partition restore prepare request\n");
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 			return ERR_ARG;
 		}
 	} else if (!strncmp(uri, "/upload/restore", 15) &&
@@ -7818,14 +7818,14 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 			    &current_restore_size)) {
 			prog_phase = -1;
 			printf("httpd: invalid partition restore upload request\n");
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 			return ERR_ARG;
 		}
 	}
 	if (recovery_backup_active) {
 		printf("httpd: rejecting destructive operation while %u backup stream(s) are active\n",
 		       recovery_backup_active);
-		strlcpy(response_uri, "/fail.html", response_uri_len);
+		strlcpy(response_uri, "/400.html", response_uri_len);
 		return ERR_USE;
 	}
 	if (prepare_request || restore_prepare_request || flash_request ||
@@ -7835,7 +7835,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 	    (recovery_stream.active &&
 	     (current_restore_prepare || current_restore_chunk))) {
 		printf("httpd: rejecting concurrent destructive operation\n");
-		strlcpy(response_uri, "/fail.html", response_uri_len);
+		strlcpy(response_uri, "/400.html", response_uri_len);
 		return ERR_USE;
 	}
 
@@ -7852,7 +7852,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		    !current_restore_size) {
 			prog_phase = -1;
 			printf("httpd: invalid partition restore confirmation\n");
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 			return ERR_ARG;
 		}
 		recv_total = content_len;
@@ -7874,7 +7874,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		    current_restore_offset != recovery_restore.written ||
 		    content_len <= 0 || content_len > RECOVERY_MMC_RESTORE_CHUNK) {
 			printf("httpd: partition restore chunk does not match the prepared session\n");
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 			return ERR_USE;
 		}
 
@@ -7884,7 +7884,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		    (ulong)content_len % blksz ||
 		    (unsigned long long)content_len > remaining) {
 			printf("httpd: unaligned or oversized partition restore chunk\n");
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 			return ERR_ARG;
 		}
 
@@ -7923,13 +7923,13 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		current_target = TARGET_FIRMWARE;
 	} else {
 		prog_phase = -1;
-		strlcpy(response_uri, "/fail.html", response_uri_len);
+		strlcpy(response_uri, "/400.html", response_uri_len);
 		return ERR_ARG;
 	}
 	if (recovery_stream_format_from_uri(uri, &current_stream_format)) {
 		prog_phase = -1;
 		printf("httpd: invalid stream format\n");
-		strlcpy(response_uri, "/fail.html", response_uri_len);
+		strlcpy(response_uri, "/400.html", response_uri_len);
 		return ERR_ARG;
 	}
 	if (current_target == TARGET_FIRMWARE &&
@@ -7940,7 +7940,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		if (ret) {
 			prog_phase = -1;
 			printf("httpd: sysupgrade profile is required before destructive erase\n");
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 			return ERR_ARG;
 		}
 		ret = recovery_stream_board_from_uri(uri, stream_board,
@@ -7948,7 +7948,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		if (ret) {
 			prog_phase = -1;
 			printf("httpd: sysupgrade board identity is required before destructive erase\n");
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 			return ERR_ARG;
 		}
 		{
@@ -7964,7 +7964,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 			} else if (ret != -ENOENT) {
 				prog_phase = -1;
 				printf("httpd: invalid sysupgrade partition pin\n");
-				strlcpy(response_uri, "/fail.html", response_uri_len);
+				strlcpy(response_uri, "/400.html", response_uri_len);
 				return ERR_ARG;
 			}
 			ret = recovery_sbe1v1k_tar_layout(stream_board,
@@ -7978,7 +7978,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 					prog_phase = -1;
 					printf("httpd: sysupgrade board '%s' requires an explicit mainline or large partition\n",
 					       stream_board);
-					strlcpy(response_uri, "/fail.html",
+					strlcpy(response_uri, "/400.html",
 						response_uri_len);
 					return ERR_USE;
 				}
@@ -7988,7 +7988,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 				printf("httpd: sysupgrade board '%s' does not match profile '%s'\n",
 				       stream_board,
 				       recovery_sbe1v1k_layout_name(current_stream_profile));
-				strlcpy(response_uri, "/fail.html", response_uri_len);
+				strlcpy(response_uri, "/400.html", response_uri_len);
 				return ERR_USE;
 			}
 		}
@@ -7997,7 +7997,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 			printf("httpd: sysupgrade profile '%s' does not match active '%s' profile\n",
 			       recovery_sbe1v1k_layout_name(current_stream_profile),
 			       recovery_sbe1v1k_layout_name(active_sbe1v1k_layout));
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 			return ERR_USE;
 		}
 	}
@@ -8005,21 +8005,21 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 	    recovery_layout_from_uri(uri, &current_repartition_layout)) {
 		prog_phase = -1;
 		printf("httpd: invalid SBE1V1K partition profile\n");
-		strlcpy(response_uri, "/fail.html", response_uri_len);
+		strlcpy(response_uri, "/400.html", response_uri_len);
 		return ERR_ARG;
 	}
 	if (current_target == TARGET_REPARTITION &&
 	    current_repartition_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT &&
 	    !qwrt_button_unlocked) {
 		printf("httpd: QWRT profile is unavailable in this recovery session\n");
-		strlcpy(response_uri, "/fail.html", response_uri_len);
+		strlcpy(response_uri, "/400.html", response_uri_len);
 		return ERR_USE;
 	}
 	if (current_target == TARGET_UBOOT &&
 	    current_stream_format != RECOVERY_STREAM_RAW) {
 		prog_phase = -1;
 		printf("httpd: chainloader uploads require raw format\n");
-		strlcpy(response_uri, "/fail.html", response_uri_len);
+		strlcpy(response_uri, "/400.html", response_uri_len);
 		return ERR_ARG;
 	}
 
@@ -8039,7 +8039,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		    content_len > RECOVERY_PREPARE_BODY_MAX) {
 			prog_phase = -1;
 			printf("httpd: invalid destructive prepare request\n");
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 			return ERR_ARG;
 		}
 	} else if (current_target == TARGET_REPARTITION) {
@@ -8048,7 +8048,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 			prog_phase = -1;
 			printf("httpd: invalid repartition request length %d\n",
 			       content_len);
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 			return ERR_ARG;
 		}
 	} else if (content_len <= 0 ||
@@ -8057,7 +8057,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 						   content_len,
 						   current_stream_format)) {
 		prog_phase = -1;
-		strlcpy(response_uri, "/fail.html", response_uri_len);
+		strlcpy(response_uri, "/400.html", response_uri_len);
 		return ERR_ARG;
 	}
 
@@ -8072,7 +8072,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 			recovery_stream_completed = false;
 			prog_phase = -1;
 			printf("httpd: destructive upload rejected; prepare target and exact size first\n");
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 			return ERR_USE;
 		}
 
@@ -8131,7 +8131,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 				prog_phase = -1;
 				printf("httpd: no sufficient RAM for upload (%u bytes)\n",
 				       recv_total);
-				strlcpy(response_uri, "/fail.html",
+				strlcpy(response_uri, "/400.html",
 					response_uri_len);
 				return ERR_MEM;
 			}
@@ -8211,7 +8211,7 @@ void httpd_post_finished(void *connection, char *response_uri, u16_t response_ur
 	int ret;
 
 	if (connection != post_connection) {
-		strlcpy(response_uri, "/fail.html", response_uri_len);
+		strlcpy(response_uri, "/400.html", response_uri_len);
 		return;
 	}
 	post_connection = NULL;
@@ -8228,7 +8228,7 @@ void httpd_post_finished(void *connection, char *response_uri, u16_t response_ur
 		    memcmp(current_restore_body, expected, expected_len)) {
 			post_ok = 0;
 			prog_phase = -1;
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 			return;
 		}
 
@@ -8250,7 +8250,7 @@ void httpd_post_finished(void *connection, char *response_uri, u16_t response_ur
 			post_ok = 0;
 			prog_phase = -1;
 			recovery_restore_reset();
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 		} else {
 			strlcpy(response_uri, "/ok", response_uri_len);
 		}
@@ -8289,7 +8289,7 @@ void httpd_post_finished(void *connection, char *response_uri, u16_t response_ur
 			sys_timeout(RECOVERY_PREPARE_START_DELAY_MS,
 				    prepare_delay_cb, NULL);
 		} else {
-			strlcpy(response_uri, "/fail.html", response_uri_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
 		}
 		return;
 	}
@@ -8312,7 +8312,7 @@ void httpd_post_finished(void *connection, char *response_uri, u16_t response_ur
     if (post_ok && recv_total && (recv_off >= recv_total))
         strlcpy(response_uri, "/ok", response_uri_len);
     else
-        strlcpy(response_uri, "/fail.html", response_uri_len);
+        strlcpy(response_uri, "/400.html", response_uri_len);
 
     /*
      * Delay flashing slightly so the browser can finish receiving the POST

@@ -1321,6 +1321,11 @@ function updateServerProgress(data){
   }
 }
 
+function requestRejected(xhr){
+  var body=xhr.responseText||"";
+  return xhr.status<200||xhr.status>=300||body.indexOf("Upload rejected")>=0;
+}
+
 function failRestore(label,message){
   operationFailed=true;
   restoreChunkActive=false;
@@ -1355,8 +1360,7 @@ function sendRestoreChunk(){
   });
   xhr.addEventListener("load",function(){
     restoreChunkActive=false;
-    if(xhr.status<200||xhr.status>=300||
-       (xhr.responseURL&&xhr.responseURL.indexOf("/fail.html")>=0)){
+    if(requestRejected(xhr)){
       operationFailed=true;
       failRestore("Rejected","The server rejected a restore chunk. Review the serial console before retrying.");
       return;
@@ -1391,8 +1395,7 @@ function restorePartition(){
 
   var xhr=new XMLHttpRequest();
   xhr.addEventListener("load",function(){
-    if(xhr.status<200||xhr.status>=300||
-       (xhr.responseURL&&xhr.responseURL.indexOf("/fail.html")>=0)){
+    if(requestRejected(xhr)){
       operationFailed=true;
       failRestore("Rejected","The server rejected the restore confirmation. Review the serial console.");
       return;
@@ -1505,8 +1508,7 @@ function sendUpload(){
     if(!complete)setState("Streaming","working","Writing upload data directly to eMMC.");
   });
   xhr.addEventListener("load",function(){
-    if(xhr.status<200||xhr.status>=300||
-       (xhr.responseURL&&xhr.responseURL.indexOf("/fail.html")>=0)){
+    if(requestRejected(xhr)){
       operationFailed=true;
       pollOutcome=-1;
       stopPolling();
@@ -1547,8 +1549,7 @@ function upload(){
 
   var xhr=new XMLHttpRequest();
   xhr.addEventListener("load",function(){
-    if(xhr.status<200||xhr.status>=300||
-       (xhr.responseURL&&xhr.responseURL.indexOf("/fail.html")>=0)){
+    if(requestRejected(xhr)){
       operationFailed=true;
       pollOutcome=-1;
       stopPolling();
