@@ -2017,21 +2017,33 @@ recovery_sbe1v1k_tar_layout(const char *board, const char *control_layout,
 		return -EINVAL;
 	}
 
-	/* Non-Spectrum identifiers cannot override their fixed layout. */
-	if (control_layout)
-		return -EINVAL;
+	/* Reference-board images are not accepted for an SBE1V1K partition. */
+	if (!strcmp(board, "qcom,ipq9574-ap-al02-c4"))
+		return -ENOENT;
 
-	/* Factory-compatible non-Spectrum images use the HLOS/rootfs pair. */
-	if (!strcmp(board, "qcom,ipq9574-ap-al02-c4")) {
-		*layout = RECOVERY_SBE1V1K_LAYOUT_MAINLINE;
-		return 0;
-	}
-
+	/*
+	 * askey,sbe1v1k is the OpenWrt mainline board name and is also used by
+	 * local large images. An explicit SBE1V1K_LAYOUT pin selects the
+	 * partition. Without one, the operator must choose mainline or large.
+	 */
 	if (!strcmp(board, "askey_sbe1v1k") ||
 	    !strcmp(board, "askey,sbe1v1k")) {
-		*layout = RECOVERY_SBE1V1K_LAYOUT_LARGE;
-		return 0;
+		if (!control_layout)
+			return -ENODATA;
+		if (!strcmp(control_layout, "mainline")) {
+			*layout = RECOVERY_SBE1V1K_LAYOUT_MAINLINE;
+			return 0;
+		}
+		if (!strcmp(control_layout, "large")) {
+			*layout = RECOVERY_SBE1V1K_LAYOUT_LARGE;
+			return 0;
+		}
+		return -EINVAL;
 	}
+
+	/* Other non-Spectrum identifiers cannot override a fixed layout. */
+	if (control_layout)
+		return -EINVAL;
 
 	return -ENOENT;
 }
@@ -2308,11 +2320,6 @@ static void recovery_qwrt_button_poll(void)
 #endif
 }
 
-/*
- * The older SBE1V1K build identifies itself as the Qualcomm AP-AL02-C4
- * board. Its own sysupgrade script writes the factory 0:HLOS/rootfs pair,
- * which is our mainline profile rather than the large chainloader layout.
- */
 static int recovery_validate_sbe1v1k_tar_control(const void *data, size_t size)
 {
 	static const char board_prefix[] = "BOARD=";
@@ -2373,13 +2380,27 @@ static int recovery_validate_sbe1v1k_tar_control(const void *data, size_t size)
 	ret = recovery_sbe1v1k_tar_layout(board,
 					 layout_found ? control_layout : NULL,
 					 &image_layout);
-	if (ret) {
+	if (ret == -ENODATA) {
+		if (current_stream_profile != RECOVERY_SBE1V1K_LAYOUT_MAINLINE &&
+		    current_stream_profile != RECOVERY_SBE1V1K_LAYOUT_LARGE) {
+			printf("SBE1V1K sysupgrade BOARD '%s' requires an explicit mainline or large partition\n",
+			       board);
+			return -EINVAL;
+		}
+		image_layout = current_stream_profile;
+	} else if (ret) {
 		if (layout_found)
 			printf("SBE1V1K sysupgrade BOARD '%s' does not support layout '%s'\n",
 			       board, control_layout);
 		else
 			printf("SBE1V1K sysupgrade BOARD '%s' is not supported\n", board);
 		return ret;
+	} else if (current_stream_profile != RECOVERY_SBE1V1K_LAYOUT_UNKNOWN &&
+		   current_stream_profile != image_layout) {
+		printf("SBE1V1K sysupgrade CONTROL partition '%s' does not match selected '%s'\n",
+		       recovery_sbe1v1k_layout_name(image_layout),
+		       recovery_sbe1v1k_layout_name(current_stream_profile));
+		return -EINVAL;
 	}
 
 	if (active_sbe1v1k_layout != image_layout) {
@@ -7530,6 +7551,30 @@ static int recovery_stream_format_from_uri(
 	return -EINVAL;
 }
 
+static int recovery_layout_token(const char *value,
+				 enum recovery_sbe1v1k_layout *layout)
+{
+	if (!value)
+		return -EINVAL;
+	if (!strncmp(value, "mainline", 8) &&
+	    (value[8] == '\0' || value[8] == '&')) {
+		*layout = RECOVERY_SBE1V1K_LAYOUT_MAINLINE;
+		return 0;
+	}
+	if (!strncmp(value, "large", 5) &&
+	    (value[5] == '\0' || value[5] == '&')) {
+		*layout = RECOVERY_SBE1V1K_LAYOUT_LARGE;
+		return 0;
+	}
+	if (!strncmp(value, "qwrt", 4) &&
+	    (value[4] == '\0' || value[4] == '&')) {
+		*layout = RECOVERY_SBE1V1K_LAYOUT_QWRT;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 static int recovery_stream_profile_from_uri(
 	const char *uri, enum recovery_sbe1v1k_layout *profile)
 {
@@ -7538,24 +7583,18 @@ static int recovery_stream_profile_from_uri(
 	*profile = RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
 	if (!value)
 		return -ENOENT;
-	value += strlen("profile=");
-	if (!strncmp(value, "mainline", 8) &&
-	    (value[8] == '\0' || value[8] == '&')) {
-		*profile = RECOVERY_SBE1V1K_LAYOUT_MAINLINE;
-		return 0;
-	}
-	if (!strncmp(value, "large", 5) &&
-	    (value[5] == '\0' || value[5] == '&')) {
-		*profile = RECOVERY_SBE1V1K_LAYOUT_LARGE;
-		return 0;
-	}
-	if (!strncmp(value, "qwrt", 4) &&
-	    (value[4] == '\0' || value[4] == '&')) {
-		*profile = RECOVERY_SBE1V1K_LAYOUT_QWRT;
-		return 0;
-	}
+	return recovery_layout_token(value + strlen("profile="), profile);
+}
 
-	return -EINVAL;
+static int recovery_stream_pin_from_uri(const char *uri,
+					enum recovery_sbe1v1k_layout *pin)
+{
+	const char *value = strstr(uri, "pin=");
+
+	*pin = RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
+	if (!value)
+		return -ENOENT;
+	return recovery_layout_token(value + strlen("pin="), pin);
 }
 
 static int recovery_stream_board_from_uri(const char *uri, char *board,
@@ -7914,10 +7953,37 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		}
 		{
 			enum recovery_sbe1v1k_layout inferred_profile;
+			enum recovery_sbe1v1k_layout pinned_profile =
+				RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
+			const char *control_layout = NULL;
 
-			ret = recovery_sbe1v1k_tar_layout(stream_board, NULL,
+			ret = recovery_stream_pin_from_uri(uri, &pinned_profile);
+			if (!ret) {
+				control_layout =
+					recovery_sbe1v1k_layout_name(pinned_profile);
+			} else if (ret != -ENOENT) {
+				prog_phase = -1;
+				printf("httpd: invalid sysupgrade partition pin\n");
+				strlcpy(response_uri, "/fail.html", response_uri_len);
+				return ERR_ARG;
+			}
+			ret = recovery_sbe1v1k_tar_layout(stream_board,
+							   control_layout,
 							   &inferred_profile);
-			if (ret || inferred_profile != current_stream_profile) {
+			if (ret == -ENODATA) {
+				if (current_stream_profile !=
+				    RECOVERY_SBE1V1K_LAYOUT_MAINLINE &&
+				    current_stream_profile !=
+				    RECOVERY_SBE1V1K_LAYOUT_LARGE) {
+					prog_phase = -1;
+					printf("httpd: sysupgrade board '%s' requires an explicit mainline or large partition\n",
+					       stream_board);
+					strlcpy(response_uri, "/fail.html",
+						response_uri_len);
+					return ERR_USE;
+				}
+			} else if (ret ||
+				   inferred_profile != current_stream_profile) {
 				prog_phase = -1;
 				printf("httpd: sysupgrade board '%s' does not match profile '%s'\n",
 				       stream_board,

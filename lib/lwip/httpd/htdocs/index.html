@@ -257,6 +257,7 @@ button{touch-action:manipulation}
 .file-help{min-height:20px;margin:8px 0 0;color:var(--muted);font-size:12px}
 .file-help.ok{color:var(--green)}
 .file-help.error{color:var(--danger)}
+.image-layout{margin-top:16px}
 .warning{
   display:grid;
   grid-template-columns:28px minmax(0,1fr);
@@ -477,6 +478,15 @@ button{touch-action:manipulation}
             <span class="file-size" id="file-size"></span>
           </div>
           <p class="file-help" id="file-help">Select a sysupgrade image.</p>
+          <div class="image-layout" id="image-layout-choice" hidden>
+            <label class="backup-label" for="image-layout-select">Partition for this image</label>
+            <select class="partition-select" id="image-layout-select">
+              <option value="">Choose mainline or large</option>
+              <option value="mainline">mainline — 7 MiB 0:HLOS</option>
+              <option value="large">large — 32 MiB kernel</option>
+            </select>
+            <p class="backup-help">This askey,sbe1v1k image has no SBE1V1K_LAYOUT line, so mainline and large cannot be told apart. Choose the partition it was built for.</p>
+          </div>
 
           <div class="warning">
             <span class="warning-mark">!</span>
@@ -608,6 +618,7 @@ var selectedFileFormat="";
 var selectedRawLayout="";
 var selectedTarBoard="";
 var selectedTarLayout="";
+var selectedImageLayoutChoice="";
 var selectedUploadFormat="raw";
 var selectedUploadProfile="";
 var fileInspection=0;
@@ -834,14 +845,34 @@ function inspectTarControl(file,epoch){
   reader.readAsArrayBuffer(file.slice(0,limit));
 }
 
+function tarBoardIsAskey(){
+  return selectedTarBoard==="askey_sbe1v1k"||selectedTarBoard==="askey,sbe1v1k";
+}
+
+function tarBoardIsSpectrum(){
+  return selectedTarBoard==="spectrum_sbe1v1k"||selectedTarBoard==="spectrum,sbe1v1k";
+}
+
+/* mainline, large and qwrt are partitions. An explicit CONTROL pin names one.
+   askey,sbe1v1k is used by both the mainline and large images, so an unpinned
+   package needs an operator choice. Unpinned Spectrum packages write 0:HLOS
+   and are qwrt only while that partition is active. */
+function imageLayoutIsAmbiguous(){
+  return activeView==="firmware"&&selectedFileFormat==="tar"&&
+    !selectedTarLayout&&tarBoardIsAskey();
+}
+
 function effectiveTarLayout(){
   if(selectedTarLayout)return selectedTarLayout;
-  if(selectedTarBoard==="qcom,ipq9574-ap-al02-c4")return"mainline";
-  if(selectedTarBoard==="askey_sbe1v1k"||
-     selectedTarBoard==="askey,sbe1v1k")return"large";
-  if(selectedTarBoard==="spectrum_sbe1v1k"||
-     selectedTarBoard==="spectrum,sbe1v1k")return activeDiskLayout;
+  if(tarBoardIsAskey())return selectedImageLayoutChoice;
+  if(tarBoardIsSpectrum())return activeDiskLayout==="qwrt"?"qwrt":"mainline";
   return"";
+}
+
+function updateImageLayoutChoice(){
+  var ambiguous=imageLayoutIsAmbiguous();
+  document.getElementById("image-layout-choice").hidden=!ambiguous;
+  document.getElementById("image-layout-select").disabled=busy||!ambiguous;
 }
 
 function selectedProfileQuery(){
@@ -849,6 +880,7 @@ function selectedProfileQuery(){
   if(selectedUploadProfile)query+="&profile="+encodeURIComponent(selectedUploadProfile);
   /* CONTROL board names are restricted to URI-safe punctuation. */
   if(selectedTarBoard)query+="&board="+selectedTarBoard;
+  if(selectedTarLayout)query+="&pin="+encodeURIComponent(selectedTarLayout);
   return query;
 }
 
@@ -956,6 +988,8 @@ function inspectSelectedFile(){
   operationFailed=false;
   selectedTarBoard="";
   selectedTarLayout="";
+  selectedImageLayoutChoice="";
+  document.getElementById("image-layout-select").value="";
   if(!file){selectedFileFormat="";selectedRawLayout="";validateFile();return}
   selectedFileFormat="pending";
   selectedRawLayout="";
@@ -1009,12 +1043,15 @@ function fileError(){
   if(selectedFileFormat==="pending")return"";
   if(activeView==="firmware"&&firmwareLocked)return"Firmware upload is locked until a verified eMMC layout migration completes.";
   if(selectedFileFormat==="unknown")return"Image must be a FIT-based raw image or an OpenWrt sysupgrade tar.";
+  if(activeView==="firmware"&&selectedFileFormat==="tar"&&
+     selectedTarBoard==="qcom,ipq9574-ap-al02-c4")
+    return"BOARD qcom,ipq9574-ap-al02-c4 is not accepted.";
   if(activeView==="firmware"&&selectedFileFormat==="tar"){
     var tarLayout=effectiveTarLayout();
-    if(layoutProfiles[activeDiskLayout]&&tarLayout&&
-       tarLayout!==activeDiskLayout&&
-       !(activeDiskLayout==="qwrt"&&tarLayout==="mainline"))
-      return"This sysupgrade image targets the "+tarLayout+" layout, not the current "+activeDiskLayout+" layout.";
+    if(imageLayoutIsAmbiguous()&&!tarLayout)
+      return"This image does not name its partition. Choose mainline or large.";
+    if(layoutProfiles[activeDiskLayout]&&tarLayout&&tarLayout!==activeDiskLayout)
+      return"This sysupgrade image targets the "+tarLayout+" partition, not the current "+activeDiskLayout+" partition.";
   }
   if(activeView==="firmware"&&selectedFileFormat==="raw"&&selectedRawLayout==="unknown")return"Raw firmware has no SquashFS at a supported layout boundary.";
   if(activeView==="firmware"&&selectedFileFormat==="raw"&&layoutProfiles[activeDiskLayout]&&selectedRawLayout!==rawLayoutForProfile(activeDiskLayout))return"Raw firmware is for the "+selectedRawLayout+" layout, not the current "+activeDiskLayout+" layout.";
@@ -1052,6 +1089,7 @@ function resetProgress(message){
 }
 
 function validateFile(){
+  updateImageLayoutChoice();
   var error=fileError();
   fileHelp.className="file-help";
   if(!selectedFile){
@@ -1107,6 +1145,7 @@ function setBusy(value){
   var buttons=document.querySelectorAll(".nav-button");
   for(var i=0;i<buttons.length;i++)buttons[i].disabled=value;
   uploadButton.disabled=value||!selectedFile||selectedFileFormat==="pending"||!!fileError();
+  updateImageLayoutChoice();
   repartitionButton.disabled=value||confirmInput.value!=="SBE1V1K_REPARTITION"||
     (layoutSelect.value==="qwrt"&&!qwrtUnlocked);
   backupButton.disabled=value||!partitionSelect.value;
@@ -1602,6 +1641,10 @@ for(var i=0;i<navButtons.length;i++)navButtons[i].addEventListener("click",funct
 });
 chooseButton.addEventListener("click",function(){if(!busy)fileInput.click()});
 fileInput.addEventListener("change",function(){selectedFile=this.files[0]||null;inspectSelectedFile()});
+document.getElementById("image-layout-select").addEventListener("change",function(){
+  selectedImageLayoutChoice=this.value;
+  validateFile();
+});
 var filePicker=document.querySelector(".file-picker");
 filePicker.addEventListener("dragover",function(event){
   event.preventDefault();
