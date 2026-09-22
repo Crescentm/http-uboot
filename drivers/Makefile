@@ -32,6 +32,7 @@ obj-$(CONFIG_$(PHASE_)PHY) += phy/
 obj-$(CONFIG_$(PHASE_)PINCTRL) += pinctrl/
 obj-$(CONFIG_$(PHASE_)POWER) += power/
 obj-$(CONFIG_$(PHASE_)RAM) += ram/
+obj-$(CONFIG_$(PHASE_)DM_RNG) += rng/
 obj-$(CONFIG_$(PHASE_)RTC) += rtc/
 obj-$(CONFIG_$(PHASE_)SERIAL) += serial/
 obj-$(CONFIG_$(PHASE_)SPI) += spi/
@@ -66,7 +67,8 @@ obj-$(CONFIG_DRAM_SUN20I_D1) += ram/
 obj-$(CONFIG_SPL_DM_RESET) += reset/
 obj-$(CONFIG_SPL_MUSB_NEW) += usb/musb-new/
 obj-$(CONFIG_SPL_USB_GADGET) += usb/gadget/
-obj-$(CONFIG_SPL_USB_GADGET) += usb/common/
+obj-$(CONFIG_SPL_DM_USB) += usb/common/
+obj-$(CONFIG_SPL_USB_MTU3) += usb/mtu3/
 obj-$(CONFIG_SPL_USB_GADGET) += usb/gadget/udc/
 obj-$(CONFIG_SPL_WATCHDOG) += watchdog/
 obj-$(CONFIG_SPL_USB_HOST) += usb/host/
@@ -131,7 +133,6 @@ obj-$(CONFIG_W1_EEPROM) += w1-eeprom/
 obj-$(CONFIG_MACH_PIC32) += ddr/microchip/
 obj-$(CONFIG_FUZZ) += fuzz/
 obj-$(CONFIG_DM_HWSPINLOCK) += hwspinlock/
-obj-$(CONFIG_$(PHASE_)DM_RNG) += rng/
 endif
 
 obj-y += soc/

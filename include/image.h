@@ -1263,10 +1263,10 @@ int fit_image_get_load(const void *fit, int noffset, ulong *load);
 int fit_image_get_entry(const void *fit, int noffset, ulong *entry);
 int fit_image_get_emb_data(const void *fit, int noffset, const void **data,
 			   size_t *size);
-int fit_image_get_data_offset(const void *fit, int noffset, int *data_offset);
+int fit_image_get_data_offset(const void *fit, int noffset, u32 *data_offset);
 int fit_image_get_data_position(const void *fit, int noffset,
-				int *data_position);
-int fit_image_get_data_size(const void *fit, int noffset, int *data_size);
+				u32 *data_position);
+int fit_image_get_data_size(const void *fit, int noffset, u32 *data_size);
 int fit_image_get_data_size_unciphered(const void *fit, int noffset,
 				       size_t *data_size);
 int fit_image_get_data(const void *fit, int noffset, const void **data,
@@ -1461,8 +1461,17 @@ int fit_image_verify_with_data(const void *fit, int image_noffset,
 int fit_image_verify(const void *fit, int noffset);
 #if CONFIG_IS_ENABLED(FIT_SIGNATURE)
 int fit_config_verify(const void *fit, int conf_noffset);
+int fit_config_verify_with_key_blob(const void *fit, int conf_noffset,
+				    const void *key_blob);
 #else
 static inline int fit_config_verify(const void *fit, int conf_noffset)
+{
+	return 0;
+}
+
+static inline int fit_config_verify_with_key_blob(const void *fit,
+						  int conf_noffset,
+						  const void *key_blob)
 {
 	return 0;
 }
@@ -1525,6 +1534,10 @@ int fit_check_format(const void *fit, ulong size);
  * Configuration 1 would be picked because the first string in U-Boot's
  * compatible list, "foo,bar", matches a compatible string in the root of fdt1.
  * "bim,bam" in fdt2 matches the second string which isn't as good as fdt1.
+ *
+ * If several configurations match at the same position, the one named by the
+ * 'default' property of the configurations node is preferred, then the first
+ * one listed.
  *
  * As an optimization, the compatible property from the FDT's root node can be
  * copied into the configuration node in the FIT image. This is required to
@@ -1883,6 +1896,29 @@ int fit_image_decrypt_data(const void *fit,
 struct image_region *fit_region_make_list(const void *fit,
 		struct fdt_region *fdt_regions, int count,
 		struct image_region *region);
+
+/**
+ * fit_config_get_signed_nodes() - Build the list of nodes covered by a config
+ *				   signature
+ *
+ * Collects the paths of the nodes that the configuration signature is
+ * computed over: the root node, the configuration node, and for each image
+ * referenced by the configuration its node, its hash subnodes and its cipher
+ * and dm-verity subnodes. The result is the same node list used when creating
+ * and verifying the signature, and is suitable for passing to
+ * fdt_find_regions().
+ *
+ * @fit:	FIT blob
+ * @conf_noffset: Configuration node offset
+ * @node_inc:	Array to fill with pointers to packed path strings
+ * @max_nodes:	Number of entries in @node_inc
+ * @buf:	Buffer for the packed null-terminated path strings
+ * @buf_len:	Size of @buf
+ * Return: number of entries written to @node_inc, or -ve on error
+ */
+int fit_config_get_signed_nodes(const void *fit, int conf_noffset,
+				char **node_inc, int max_nodes,
+				char *buf, int buf_len);
 
 static inline int fit_image_check_target_arch(const void *fdt, int node)
 {

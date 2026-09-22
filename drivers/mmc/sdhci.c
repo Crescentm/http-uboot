@@ -551,7 +551,7 @@ void sdhci_set_uhs_timing(struct sdhci_host *host)
 
 void sdhci_set_voltage(struct sdhci_host *host)
 {
-	if (IS_ENABLED(CONFIG_MMC_IO_VOLTAGE)) {
+	if (CONFIG_IS_ENABLED(MMC_IO_VOLTAGE)) {
 		struct mmc *mmc = (struct mmc *)host->mmc;
 		u32 ctrl;
 
@@ -733,7 +733,8 @@ static int sdhci_init(struct mmc *mmc)
 	 */
 	host->force_align_buffer = true;
 #else
-	if (host->quirks & SDHCI_QUIRK_32BIT_DMA_ADDR) {
+	if ((host->quirks & SDHCI_QUIRK_32BIT_DMA_ADDR) &&
+	    !host->align_buffer) {
 		host->align_buffer = memalign(8, 512 * 1024);
 		if (!host->align_buffer) {
 			log_err("Aligned buffer alloc failed\n");

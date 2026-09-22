@@ -170,7 +170,8 @@ dtb-$(CONFIG_ARCH_MVEBU) +=			\
 	cn9130-crb-B.dtb			\
 	ac5-98dx35xx-rd.dtb			\
 	ac5-98dx35xx-atl-x240.dtb		\
-	cn9130-atl-x250.dtb
+	cn9130-atl-x250.dtb			\
+	cn9130-atl-x960-28ysq.dtb
 endif
 
 dtb-$(CONFIG_ARCH_SYNQUACER) += synquacer-sc2a11-developerbox.dtb
@@ -1154,7 +1155,7 @@ dtb-$(CONFIG_TARGET_SC589_MINI) += sc589-mini.dtb
 dtb-$(CONFIG_TARGET_SC589_EZKIT) += sc589-ezkit.dtb
 dtb-$(CONFIG_TARGET_SC594_SOM_EZKIT) += sc594-som-ezkit.dtb
 dtb-$(CONFIG_TARGET_SC594_SOM_EZLITE) += sc594-som-ezlite.dtb
-dtb-$(CONFIG_TARGET_SC598_SOM_EZKIT) += sc598-som-ezkit.dtb
+dtb-$(CONFIG_TARGET_SC598_SOM_EZKIT) += sc598-som-ezkit.dtb sc598-som-ezkit-sd.dtb
 dtb-$(CONFIG_TARGET_SC598_SOM_EZLITE) += sc598-som-ezlite.dtb
 
 ifneq ($(CONFIG_TARGET_IMX8MP_RSB3720A1_4G)$(CONFIG_TARGET_IMX8MP_RSB3720A1_6G),)

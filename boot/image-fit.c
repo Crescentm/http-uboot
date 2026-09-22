@@ -963,7 +963,7 @@ int fit_image_get_emb_data(const void *fit, int noffset, const void **data,
  *     0, on success
  *     -ENOENT if the property could not be found
  */
-int fit_image_get_data_offset(const void *fit, int noffset, int *data_offset)
+int fit_image_get_data_offset(const void *fit, int noffset, u32 *data_offset)
 {
 	const fdt32_t *val;
 
@@ -988,7 +988,7 @@ int fit_image_get_data_offset(const void *fit, int noffset, int *data_offset)
  *     -ENOENT if the property could not be found
  */
 int fit_image_get_data_position(const void *fit, int noffset,
-				int *data_position)
+				u32 *data_position)
 {
 	const fdt32_t *val;
 
@@ -1012,7 +1012,7 @@ int fit_image_get_data_position(const void *fit, int noffset,
  *     0, on success
  *     -ENOENT if the property could not be found
  */
-int fit_image_get_data_size(const void *fit, int noffset, int *data_size)
+int fit_image_get_data_size(const void *fit, int noffset, u32 *data_size)
 {
 	const fdt32_t *val;
 
@@ -1070,18 +1070,13 @@ int fit_image_get_data(const void *fit, int noffset, const void **data,
 		       size_t *size)
 {
 	bool external_data = false;
-	int offset;
-	int len;
 	int ret;
 	size_t fdt_total_size_aligned;
+	u32 offset;
+	u32 len;
 	uintptr_t max_offset;
 
 	if (!fit_image_get_data_position(fit, noffset, &offset)) {
-		if (offset < 0) {
-			printf("Invalid external data position: %d\n", offset);
-			return -EINVAL;
-		}
-
 		external_data = true;
 	} else if (!fit_image_get_data_offset(fit, noffset, &offset)) {
 		/*
@@ -1090,9 +1085,9 @@ int fit_image_get_data(const void *fit, int noffset, const void **data,
 		 * for the data-offset properties in each image.
 		 */
 		fdt_total_size_aligned = ((fdt_totalsize(fit) + 3) & ~3);
-		/* The resulting offset cannot exceed INT_MAX */
-		if (offset < 0 || fdt_total_size_aligned > INT_MAX - offset) {
-			printf("Invalid external data offset: %d\n", offset);
+		/* The resulting offset cannot exceed UINT32_MAX */
+		if (fdt_total_size_aligned > UINT32_MAX - offset) {
+			printf("Invalid external data offset: %u\n", offset);
 			return -EINVAL;
 		}
 		offset += fdt_total_size_aligned;
@@ -1106,16 +1101,12 @@ int fit_image_get_data(const void *fit, int noffset, const void **data,
 		max_offset = UINTPTR_MAX - (uintptr_t)fit;
 		/* Check that external data offset is within the addressable range */
 		if (offset > max_offset) {
-			printf("Invalid external data offset: %d\n", offset);
+			printf("Invalid external data offset: %u\n", offset);
 			return -EINVAL;
 		}
 
 		ret = fit_image_get_data_size(fit, noffset, &len);
 		if (!ret) {
-			if (len < 0) {
-				printf("Invalid external data size: %d\n", len);
-				return -EINVAL;
-			}
 			/*
 			 * For non-signed FIT images, we can only check that
 			 * (offset + len) doesn't exceed the addressable range.
@@ -1135,7 +1126,7 @@ int fit_image_get_data(const void *fit, int noffset, const void **data,
 			    len > CONFIG_VAL(FIT_SIGNATURE_MAX_SIZE) - offset
 #endif
 			) {
-				printf("FIT external data is out of bounds (offset=%d, size=%d)\n",
+				printf("FIT external data is out of bounds (offset=%u, size=%u)\n",
 				       offset, len);
 				return -EINVAL;
 			}
@@ -1799,6 +1790,8 @@ int fit_conf_find_compat(const void *fit, const void *fdt)
 	int fdt_compat_len;
 	int best_match_offset = 0;
 	int best_match_pos = 0;
+	const char *default_name;
+	int default_noffset = -1;
 
 	confs_noffset = fdt_path_offset(fit, FIT_CONFS_PATH);
 	images_noffset = fdt_path_offset(fit, FIT_IMAGES_PATH);
@@ -1811,6 +1804,15 @@ int fit_conf_find_compat(const void *fit, const void *fdt)
 	if (!fdt_compat) {
 		debug("Fdt for comparison has no \"compatible\" property.\n");
 		return -ENXIO;
+	}
+
+	/* the default configuration breaks ties between equal matches */
+	default_name = fdt_getprop(fit, confs_noffset, FIT_DEFAULT_PROP, NULL);
+	if (default_name) {
+		default_noffset = fdt_subnode_offset(fit, confs_noffset,
+						     default_name);
+		if (default_noffset < 0)
+			default_noffset = -1;
 	}
 
 	/*
@@ -1863,10 +1865,15 @@ int fit_conf_find_compat(const void *fit, const void *fdt)
 		cur_fdt_compat = fdt_compat;
 		/*
 		 * Look for a match for each U-Boot compatibility string in
-		 * turn in the compat string property.
+		 * turn in the compat string property. A configuration only
+		 * replaces the current best match on a strictly better
+		 * position, or on an equal position if it is the default
+		 * configuration.
 		 */
 		for (i = 0; len > 0 &&
-		     (!best_match_offset || best_match_pos > i); i++) {
+		     (!best_match_offset || best_match_pos > i ||
+		      (best_match_pos == i && noffset == default_noffset));
+		     i++) {
 			int cur_len = strlen(cur_fdt_compat) + 1;
 
 			if (!fdt_node_check_compatible(fdt, compat_noffset,
