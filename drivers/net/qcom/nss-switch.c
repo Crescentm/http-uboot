@@ -2165,6 +2165,15 @@ void ipq_ppe_provision_init(struct ppe_info *info)
 		/* Allowing tftp packets */
 		ipq_ppe_acl_set(&acl_set);
 	}
+
+	if (IS_ENABLED(CONFIG_NETCONSOLE)) {
+		UPDATE_ACL_SET(acl_set, reg_base, 4, ADPT_ACL_HPPE_IPV4_DIP_RULE,
+			       UDP_PKT, env_get_ulong("ncinport", 10, 6666),
+			       0xffff, 0, 0, info->ipo_action);
+
+		/* Allowing netconsole input */
+		ipq_ppe_acl_set(&acl_set);
+	}
 }
 
 /*

@@ -376,6 +376,27 @@ static void reboot_delay_cb(void *arg)
     reboot_request = 1;
 }
 
+/*
+ * Mirror the console to UDP broadcast so recovery (and a RAM boot started
+ * from it) can be observed and interrupted without opening the case:
+ *   macOS/Linux: nc -u -l 6666   (or: nc -u 192.168.255.1 6666 to type)
+ * Set recovery_netconsole=0 to disable, or ncip to direct it elsewhere.
+ */
+static void recovery_netconsole_start(void)
+{
+	if (!IS_ENABLED(CONFIG_NETCONSOLE) ||
+	    !env_get_yesno("recovery_netconsole"))
+		return;
+
+	if (!env_get("ncip"))
+		env_set("ncip", "255.255.255.255");
+	env_set("stdout", "serial,nc");
+	env_set("stderr", "serial,nc");
+	env_set("stdin", "serial,nc");
+	printf("Netconsole on UDP %s:%s\n", env_get("ncip"),
+	       env_get("ncoutport") ?: "6666");
+}
+
 static void recovery_prepare_static_network(void)
 {
 	env_set("ipaddr", RECOVERY_STATIC_IPADDR);
@@ -9115,6 +9136,7 @@ int run_http_recovery(void)
 		rc = -ENODEV;
 		goto out;
 	}
+	recovery_netconsole_start();
 	recovery_watchdog_poll();
 
 	recovery_debug_printf("HTTP recovery: starting DHCP helper\n");
