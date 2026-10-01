@@ -1,0 +1,61 @@
+name: SBE1V1K chainloader
+
+on:
+  push:
+    branches: [sbe1v1k-custom]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu bc bison flex \
+            libssl-dev libgnutls28-dev uuid-dev python3-setuptools \
+            python3-pyelftools swig device-tree-compiler
+
+      - name: Build U-Boot
+        run: |
+          make sbe1v1k_chainloader_defconfig
+          make CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)"
+
+      - name: Package chainloader FIT
+        run: |
+          set -o pipefail
+          board/qualcomm/sbe1v1k-chainloader-fit/build-chainloader-fit.sh \
+            --payload u-boot.bin --outdir sbe1v1k-chainloader | tee build-info.txt
+          if grep -q 'Embedded banner:.*dirty' build-info.txt; then
+            echo "::error::release banner contains 'dirty'"
+            exit 1
+          fi
+          cd sbe1v1k-chainloader
+          sha256sum sbe1v1k-chainloader.itb sbe1v1k-chainloader-partition.img > sha256sums
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbe1v1k-chainloader-${{ github.sha }}
+          path: |
+            sbe1v1k-chainloader/sbe1v1k-chainloader.itb
+            sbe1v1k-chainloader/sbe1v1k-chainloader-partition.img
+            sbe1v1k-chainloader/sha256sums
+            build-info.txt
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --notes-file build-info.txt \
+            sbe1v1k-chainloader/sbe1v1k-chainloader.itb \
+            sbe1v1k-chainloader/sbe1v1k-chainloader-partition.img \
+            sbe1v1k-chainloader/sha256sums
