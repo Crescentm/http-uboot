@@ -127,6 +127,8 @@ static bool recovery_board_is_sbe1v1k(void)
 #define RECOVERY_SQUASHFS_BYTES_OFF  40U
 #define RECOVERY_SQUASHFS_HEADER_MIN 48U
 #define RECOVERY_REPARTITION_MAX    64UL
+/* Compressed FIT size; bootm enforces CONFIG_SYS_BOOTM_LEN on the payload. */
+#define RECOVERY_RAMBOOT_MAX        (256 * 1024 * 1024UL)
 #define RECOVERY_RESTORE_BODY_MAX   96UL
 #define RECOVERY_RESTORE_ID_MAX     32U
 #define RECOVERY_SBE1V1K_GPT_MAX    12288UL
@@ -311,6 +313,9 @@ static int flash_request;
 static int prepare_request;
 static int restore_prepare_request;
 static volatile int reboot_request;
+/* A verified FIT that is booted from RAM once the server has shut down. */
+static bool current_ramboot;
+static volatile int ramboot_request;
 static unsigned int recovery_backup_active;
 /* Progress for /status polling */
 static volatile u32 prog_total; /* combined total for backward compat */
@@ -376,6 +381,12 @@ static void reboot_delay_cb(void *arg)
     reboot_request = 1;
 }
 
+static void ramboot_delay_cb(void *arg)
+{
+	(void)arg;
+	ramboot_request = 1;
+}
+
 /*
  * Mirror the console to UDP broadcast so recovery (and a RAM boot started
  * from it) can be observed and interrupted without opening the case:
@@ -395,6 +406,24 @@ static void recovery_netconsole_start(void)
 	env_set("stdin", "serial,nc");
 	printf("Netconsole on UDP %s:%s\n", env_get("ncip"),
 	       env_get("ncoutport") ?: "6666");
+}
+
+/*
+ * Detach netconsole before handing over to an OS. eth_halt() in bootm only
+ * stops the PHYs, and every later console line sent through nc would bring
+ * the link (and EDMA receive) back up underneath the starting kernel.
+ * Dropping the last nc user stops the shared lwIP runtime instead.
+ */
+static void recovery_netconsole_stop(void)
+{
+	const char *out = env_get("stdout");
+
+	if (!IS_ENABLED(CONFIG_NETCONSOLE) || !out || !strstr(out, "nc"))
+		return;
+
+	env_set("stdin", "serial");
+	env_set("stdout", "serial");
+	env_set("stderr", "serial");
 }
 
 static void recovery_prepare_static_network(void)
@@ -4708,6 +4737,47 @@ static bool recovery_is_sbe1v1k_chainloader_fit(const void *fit,
 	       recovery_fit_has_image_node(fit, "uboot-1");
 }
 
+/* Accept only FITs that bootm can start from their default configuration. */
+static int recovery_ramboot_check(const void *fit, size_t fit_size)
+{
+	if (fit_check_format(fit, fit_size)) {
+		printf("RAM boot image is not a valid FIT\n");
+		return -EINVAL;
+	}
+	if (fit_conf_get_node(fit, NULL) < 0) {
+		printf("RAM boot FIT has no default configuration\n");
+		return -ENOENT;
+	}
+
+	return 0;
+}
+
+/*
+ * Boot an uploaded FIT without touching eMMC.  bootm only returns on
+ * failure; reset then, because an unattended device has no console.
+ */
+static void recovery_ramboot(ulong addr, size_t len)
+{
+	ulong boot_addr = addr;
+
+	if (recovery_is_sbe1v1k_chainloader_fit((const void *)addr, len)) {
+		/* The chainloader shim only searches its fixed FIT addresses. */
+		boot_addr = RECOVERY_SBE1V1K_FIT_PERSISTENT_ADDR;
+		memmove((void *)boot_addr, (const void *)addr, len);
+		flush_cache(boot_addr, ALIGN(len, ARCH_DMA_MINALIGN));
+	} else {
+		/* An initramfs must not wait for the installed root device. */
+		env_set("bootargs", "console=ttyMSM0,115200n8");
+	}
+
+	printf("Booting uploaded FIT from RAM at 0x%08lx (%zu bytes)\n",
+	       boot_addr, len);
+	recovery_netconsole_stop();
+	run_commandf("bootm 0x%lx", boot_addr);
+	printf("RAM boot failed, resetting\n");
+	do_reset(NULL, 0, 0, NULL);
+}
+
 static bool recovery_ram_range_ok(ulong addr, size_t size)
 {
 	ulong ram_start = (ulong)gd->ram_base;
@@ -8341,6 +8411,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 	recv_total = 0;
 	current_force_recreate = false;
 	current_prepare_only = false;
+	current_ramboot = false;
 	current_stream_profile = RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
 
 	if (current_restore_prepare) {
@@ -8415,6 +8486,11 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 	} else if (!strncmp(uri, "/action/repartition", 19) &&
 		   (uri[19] == '\0' || uri[19] == '?')) {
 		current_target = TARGET_REPARTITION;
+	} else if (!strncmp(uri, "/upload/ramboot", 15) &&
+		   (uri[15] == '\0' || uri[15] == '?')) {
+		/* RAM-only: never streamed, validated or flashed as firmware. */
+		current_target = TARGET_FIRMWARE;
+		current_ramboot = true;
 	} else if (!strncmp(uri, "/upload", 7) &&
 		   (uri[7] == '\0' || uri[7] == '?')) {
 		current_target = TARGET_FIRMWARE;
@@ -8528,6 +8604,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 
 	stream_enabled = recovery_backend_is_mmc() &&
 			 env_get_yesno("recovery_stream") == 1 &&
+			 !current_ramboot &&
 			 (current_target == TARGET_FIRMWARE ||
 			  current_target == TARGET_UBOOT);
 
@@ -8544,6 +8621,15 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		    (ulong)content_len > RECOVERY_REPARTITION_MAX) {
 			prog_phase = -1;
 			printf("httpd: invalid repartition request length %d\n",
+			       content_len);
+			strlcpy(response_uri, "/400.html", response_uri_len);
+			return ERR_ARG;
+		}
+	} else if (current_ramboot) {
+		if (content_len <= 0 ||
+		    (ulong)content_len > RECOVERY_RAMBOOT_MAX) {
+			prog_phase = -1;
+			printf("httpd: invalid RAM boot image length %d\n",
 			       content_len);
 			strlcpy(response_uri, "/400.html", response_uri_len);
 			return ERR_ARG;
@@ -8637,7 +8723,8 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 	}
 
 	post_ok = 1;
-	tname = current_target == TARGET_FIRMWARE ? "firmware" :
+	tname = current_ramboot ? "RAM boot" :
+		current_target == TARGET_FIRMWARE ? "firmware" :
 		current_target == TARGET_UBOOT ? "uboot" : "repartition";
 	if (current_prepare_only)
 		recovery_debug_printf("httpd: accepting erase preparation for %s\n", tname);
@@ -8788,6 +8875,25 @@ void httpd_post_finished(void *connection, char *response_uri, u16_t response_ur
 		} else {
 			strlcpy(response_uri, "/400.html", response_uri_len);
 		}
+		return;
+	}
+
+	if (current_ramboot) {
+		if (!post_ok || !recv_total || recv_off != recv_total ||
+		    recovery_ramboot_check(recv_base, recv_total)) {
+			post_ok = 0;
+			prog_phase = -1;
+			strlcpy(response_uri, "/400.html", response_uri_len);
+			return;
+		}
+
+		recovery_debug_printf("httpd: RAM boot image verified, %u bytes at 0x%08lx\n",
+				      recv_total, (ulong)recv_base);
+		prog_phase = 3;
+		prog_reboot = 1;
+		strlcpy(response_uri, "/ok", response_uri_len);
+		/* Let the browser receive the reply before the network stops. */
+		sys_timeout(REBOOT_DELAY_MS, ramboot_delay_cb, NULL);
 		return;
 	}
 
@@ -9093,7 +9199,9 @@ int run_http_recovery(void)
 	current_restore_id[0] = '\0';
 	current_restore_size = 0;
 	current_restore_offset = 0;
+	current_ramboot = false;
 	reboot_request = 0;
+	ramboot_request = 0;
 	memset(&leds, 0, sizeof(leds));
 	memset(&status_leds, 0, sizeof(status_leds));
 	memset(&dhcp, 0, sizeof(dhcp));
@@ -9222,6 +9330,8 @@ int run_http_recovery(void)
 		}
 		if (reboot_request)
 			do_reset(NULL, 0, 0, NULL);
+		if (ramboot_request)
+			break;
 		if (timeout_ms && !post_ok && !upload_done && !flash_request &&
 		    !reboot_request && prog_phase == 0 &&
 			get_timer(start_ms) >= timeout_ms) {
@@ -9251,6 +9361,12 @@ out:
 	recovery_board_http_acl(false);
 	env_set("eth_allow_no_link", saved_allow_no_link);
 	free(saved_allow_no_link);
+
+	/* The network is down now, so the new image starts from a clean state. */
+	if (ramboot_request) {
+		ramboot_request = 0;
+		recovery_ramboot((ulong)recv_base, recv_total);
+	}
 
 	return rc;
 }

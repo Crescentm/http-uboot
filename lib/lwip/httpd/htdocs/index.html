@@ -434,6 +434,7 @@ button{touch-action:manipulation}
     <nav class="nav" aria-label="Recovery operations">
       <button class="nav-button active" type="button" data-view="firmware" aria-current="page"><span class="nav-mark"></span>Firmware</button>
       <button class="nav-button" type="button" data-view="uboot"><span class="nav-mark"></span>Chainloader</button>
+      <button class="nav-button" type="button" data-view="ramboot"><span class="nav-mark"></span>RAM boot</button>
       <button class="nav-button" type="button" data-view="layout"><span class="nav-mark"></span>eMMC layout</button>
       <button class="nav-button" type="button" data-view="backup"><span class="nav-mark"></span>Backup</button>
     </nav>
@@ -669,6 +670,20 @@ var profiles={
     warning:"chainloader is erased before writing. A failed transfer can break recovery boot.",
     note:"Other partitions are not modified.",
     action:"Upload chainloader"
+  },
+  ramboot:{
+    eyebrow:"Test boot",
+    title:"Boot from RAM",
+    copy:"Start an initramfs or chainloader FIT once without writing eMMC.",
+    target:"RAM only",
+    methodLabel:"Mode",
+    method:"Upload, verify, boot",
+    limitLabel:"Size",
+    limit:"Up to 256 MiB",
+    help:"Select an initramfs or chainloader .itb image.",
+    warning:"Nothing is written to eMMC. Power-cycle to return to the installed system.",
+    note:"This page stops responding once the image starts.",
+    action:"Boot from RAM"
   },
   layout:{
     eyebrow:"Storage migration",
@@ -1063,6 +1078,8 @@ function fileError(){
   if(activeView==="uboot"&&selectedFileFormat!=="raw")return"Chainloader must be a raw FIT image.";
   if(activeView==="uboot"&&selectedFile.size>4*1024*1024)return"Chainloader must not exceed 4 MiB.";
   if(activeView==="uboot"&&selectedFile.size===0)return"Chainloader image is empty.";
+  if(activeView==="ramboot"&&selectedFileFormat!=="raw")return"RAM boot needs a FIT (.itb) image.";
+  if(activeView==="ramboot"&&selectedFile.size>256*1024*1024)return"RAM boot image must not exceed 256 MiB.";
   return"";
 }
 
@@ -1294,6 +1311,8 @@ function setView(view){
   document.getElementById("backup-view").hidden=!backup;
   document.getElementById("progress-section").hidden=backup&&!restoreInProgress;
   document.getElementById("row-upload").hidden=layout;
+  document.getElementById("row-erase").hidden=view==="ramboot";
+  document.getElementById("row-write").hidden=view==="ramboot";
   resetProgress();
   if(upload){
     fileHelp.textContent=p.help;
@@ -1535,8 +1554,44 @@ function sendUpload(){
   xhr.send(selectedFile);
 }
 
+function ramboot(){
+  setBusy(true);
+  resetProgress("Uploading the image into RAM.");
+  pollEpoch++;
+  pollOutcome=0;
+  stopPolling();
+  setState("Uploading","working","Transferring the image into RAM. eMMC is not modified.");
+
+  var xhr=new XMLHttpRequest();
+  xhr.upload.addEventListener("progress",function(event){
+    if(!event.lengthComputable)return;
+    setProgress("upload",event.loaded*100/event.total,"active");
+    document.getElementById("progress-detail").textContent=formatBytes(event.loaded)+" / "+formatBytes(event.total);
+  });
+  xhr.addEventListener("load",function(){
+    if(requestRejected(xhr)){
+      operationFailed=true;
+      setState("Rejected","error","The image is not a bootable FIT. Nothing was changed.");
+      setBusy(false);
+      return;
+    }
+    setProgress("upload",100,"complete");
+    // The server stops once the image starts, so this page stays busy.
+    setState("Booting","success","Image verified and starting from RAM. Power-cycle to return to the installed system.");
+  });
+  xhr.addEventListener("error",function(){
+    operationFailed=true;
+    setState("Network error","error","The upload was interrupted. Nothing was written to eMMC.");
+    setBusy(false);
+  });
+  xhr.open("POST","/upload/ramboot",true);
+  xhr.setRequestHeader("Content-Type","application/octet-stream");
+  xhr.send(selectedFile);
+}
+
 function upload(){
   if(!selectedFile||fileError()||activeView==="layout")return;
+  if(activeView==="ramboot"){ramboot();return}
   selectedUploadFormat=activeView==="firmware"&&selectedFileFormat==="tar"?"tar":"raw";
   selectedUploadProfile=selectedUploadFormat==="tar"?effectiveTarLayout():"";
   if(activeView==="firmware"&&selectedUploadFormat==="tar"&&!selectedUploadProfile){
