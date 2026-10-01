@@ -8,7 +8,18 @@ The chainloader solves three board-specific problems:
 - OpenWrt mainline and the large-storage installation use different GPT layouts and boot arguments;
 - firmware images can be too large to stage completely in RAM.
 
-> **Warning:** Firmware and chainloader updates are intentionally destructive. The HTTP server erases the selected partitions before it receives the image body. Power loss, a network interruption, or an incorrect image can leave the active system unbootable. Make a per-device backup and retain serial access to the stock U-Boot before changing the GPT or flashing an image.
+> **Warning:** Firmware and chainloader updates are intentionally destructive. The HTTP server erases the selected partitions before it receives the image body. Power loss, a network interruption, or an incorrect image can leave the active system unbootable. Make a per-device backup and keep a way back to the stock U-Boot, either serial access or the stock network recovery described below, before changing the GPT or flashing an image.
+
+## About This Fork
+
+This is the `sbe1v1k-custom` branch of [Crescentm/http-uboot](https://github.com/Crescentm/http-uboot), based on the `sbe1v1k` branch of [YYH2913/http-uboot](https://github.com/YYH2913/http-uboot). It adds:
+
+- **QSDK GPT migration**: units running a 28-partition QSDK layout can migrate to `large`, `mainline`, or `qwrt` from the web UI.
+- **RAM boot**: upload an initramfs or chainloader FIT and boot it once without writing eMMC.
+- **Netconsole**: the recovery console is mirrored to UDP, so the board can be observed and controlled without opening the case. It is based on James Hilliard's lwIP netconsole series, which is not yet merged upstream.
+- **CI builds**: every push builds the FIT; `v*` tags publish it as a release.
+
+[中文说明](README_CN.md)
 
 ## Features
 
@@ -24,6 +35,9 @@ The chainloader solves three board-specific problems:
 | Partition backup            | Downloads `boot0`, `boot1`, or any GPT partition individually, or streams all readable partitions into one tar archive |
 | Multi-rate Ethernet         | The current NSS/PPE path supports QCA8075 1G, QCA8081 2.5G, and RTL8261BE multi-rate/10G PHYs |
 | Recovery status LEDs        | Hardware PWM reports preparation, erase, write, completion, and error states |
+| QSDK GPT migration          | The 28-partition QSDK tail is recognised and migrated: `0:WIFIFW` is moved with a resumable, CRC-checked copy and P1-P21 are preserved |
+| RAM boot                    | `/upload/ramboot` accepts a FIT of up to 256 MiB, checks it, and boots it from RAM; eMMC is not touched |
+| Netconsole                  | HTTP recovery broadcasts its console to UDP port 6666 and accepts input on the same port |
 | Serial diagnostics          | Board-log analysis and NSS/PPE/EDMA counter snapshots are available for network debugging |
 
 HTTP recovery keeps the serial console quiet during normal operation. Set the U-Boot environment variable `recovery_debug=1` before starting `http_recovery` to enable its optional lifecycle and protocol diagnostics; validation, storage, and network errors remain visible without it. This switch is separate from the on-demand `nss_debug` command and `nss_debug_log` trace setting.
@@ -42,6 +56,35 @@ bootm 0x80000000
 ```
 
 Do not run `saveenv`. TFTP places the raw FIT at `0x80000000`. The persistent stock boot path later reads the installed FIT from eMMC to `0x44000000`; the shim recognizes both addresses.
+
+#### Without Serial Access
+
+The stock U-Boot has a network recovery path that needs no console:
+
+1. When Reset is held at power-on, it requests DHCP.
+2. If the offer carries vendor option 43 set to `askey`, it fetches `rtq7300t_boot_auto_upgrade_fw.img` from `172.16.252.252` over TFTP.
+3. It runs the `script` image inside that file.
+
+Use it to boot the chainloader FIT from RAM:
+
+1. Put the host on the LAN1 port as `172.16.252.252/16`, and serve DHCP (range `172.16.252.10`-`172.16.252.20`, option 43 `askey`) and TFTP. For example:
+
+   ```sh
+   dnsmasq --interface=<if> --bind-interfaces --port=0 \
+   	--dhcp-range=172.16.252.10,172.16.252.20,255.255.0.0,5m \
+   	--dhcp-option=43,askey --enable-tftp --tftp-root=<dir>
+   ```
+
+2. In the TFTP root, place `sbe1v1k-chainloader.itb` and an `rtq7300t_boot_auto_upgrade_fw.img` built with `mkimage -f auto.its`. The `.its` file contains a one-byte `firmware` image named `RTQ7300T` and a `script` image with this content:
+
+   ```sh
+   setenv serverip 172.16.252.252
+   if tftpboot 0x80000000 sbe1v1k-chainloader.itb; then
+   	bootm 0x80000000
+   fi
+   ```
+
+3. Remove power. **Hold Reset first, then apply power.** The stock U-Boot checks the button only during its early autoboot countdown; pressing it after power-on boots the installed system instead. Keep holding until the chainloader has been transferred, then a few seconds more, so the chainloader also sees the button and starts HTTP recovery.
 
 ### 2. Start HTTP Recovery and Back Up the Device
 
@@ -112,7 +155,7 @@ The screenshots below are rendered from the current embedded `index.html` with r
 
 ### Shared Controls and Status
 
-The sidebar selects one of four operation pages. The header of every page shows the current target, operation mode, and size or boundary limit. The state badge reports `Idle`, `Ready`, `Preparing`, `Erasing`, `Writing`, `Done`, or an error state as appropriate.
+The sidebar selects one of five operation pages. The header of every page shows the current target, operation mode, and size or boundary limit. The state badge reports `Idle`, `Ready`, `Preparing`, `Erasing`, `Writing`, `Done`, or an error state as appropriate.
 
 Firmware and Chainloader operations use three progress rows:
 
@@ -153,6 +196,16 @@ The **Chainloader** page updates this second-stage U-Boot installation.
 
 The padded `sbe1v1k-chainloader-partition.img` is intended for offline writes; the HTTP page should use the smaller raw `.itb`.
 
+### RAM Boot Page
+
+The **RAM boot** page starts an image once without writing storage.
+
+- **Choose file** accepts a FIT (`.itb`) of up to 256 MiB: an OpenWrt `initramfs` image to test firmware, or `sbe1v1k-chainloader.itb` to test a new chainloader.
+- The image is checked with `fit_check_format()` and must have a default configuration. It is never streamed to eMMC.
+- A chainloader FIT is moved to `0x44000000`, where its shim looks for it. An initramfs is booted with `console=ttyMSM0,115200n8` only, so it does not wait for the installed root device.
+- The reply is sent first, then the server stops, netconsole is detached, and `bootm` runs. If `bootm` returns, the board resets.
+- Power-cycle to return to the installed system.
+
 ### eMMC Layout Page
 
 ![eMMC layout migration page](board/qualcomm/sbe1v1k-chainloader-fit/images/recovery-layout.png)
@@ -162,6 +215,12 @@ The **eMMC layout** page changes the supported partition profile.
 - **Partition profile** supports **OpenWrt mainline / factory-compatible**, **Large storage**, and **QWRT factory** compatibility.
 - The live table shows the target labels, start LBAs, sizes, and purpose.
 - All migration profiles use LBA `110626` as the preserved-prefix boundary.
+- A 28-partition QSDK source layout is recognised as `qsdk`:
+  - `0:WIFIFW` is moved from LBA 40482 to 40994 and `0:WIFIFW_1` receives a verified copy;
+  - `0:LICENSE`, `0:HLOS`, and `0:HLOS_1` are recreated empty;
+  - P1-P21 are preserved.
+
+  A CRC-checked marker at the start of `0:HLOS_1` lets an interrupted move be resumed.
 - The warning describes which tail definition will be replaced and which firmware must be uploaded before rebooting.
 - The action remains disabled until the exact token `SBE1V1K_REPARTITION` is entered.
 - The migration verifies fixed factory anchors, preserves the running FIT, writes and verifies the new GPT, reinstalls the FIT in the new target, and updates and verifies `0:APPSBLENV`.
@@ -185,6 +244,20 @@ The **Backup** page is read-only.
 - Factory-sized full backups exceed 7 GiB. Allow approximately 15 minutes, depending on the network connection and destination storage. The destination filesystem must have enough free space and must not be FAT32.
 
 Raw backups can contain MAC addresses, calibration data, keys, and license material. Store them as device-specific secrets and calculate an external SHA256 for important archives.
+
+## Netconsole
+
+HTTP recovery mirrors the console to UDP, so no serial adapter is needed to follow it or to type commands:
+
+```sh
+nc -u -l 6666               # watch: output is broadcast to 255.255.255.255:6666
+nc -u 192.168.255.1 6666    # type: Ctrl-C leaves recovery for the U-Boot prompt
+```
+
+- Set `recovery_netconsole=0` to disable it. Set `ncip` to send to one host instead of broadcasting, and `ncinport` and `ncoutport` to change the ports.
+- The NSS switch drops UDP to the CPU except DHCP, the TFTP port, and the netconsole input port.
+- Netconsole stays attached at the U-Boot prompt after recovery exits. Run `http_recovery` to go back.
+- Before an OS starts, the console is switched back to serial. Both `boot_openwrt` and RAM boot do this. `eth_halt()` only stops the PHYs, so any console line sent over the network after that would bring the link and EDMA receive back up underneath the new kernel.
 
 ## Safety Boundaries
 
@@ -219,6 +292,8 @@ The packaging script prints a SHA256 for every artifact and the U-Boot version e
 | `sbe1v1k-chainloader-shim.bin`      | First-stage shim embedded in the FIT               | Build intermediate; do not flash directly                    |
 | `sbe1v1k-chainloader-control.dtb`   | Control DTB embedded in the FIT                    | Build intermediate; do not flash directly                    |
 | `u-boot.bin`                        | The actual second-stage U-Boot payload             | Never pass directly to stock `bootm` or write directly to eMMC |
+
+GitHub Actions (`.github/workflows/sbe1v1k-chainloader.yml`) builds the same artifacts on every push. Each run keeps them as a workflow artifact, and a `v*` tag publishes them as a release.
 
 ## Flashing Workflow Summary
 
@@ -552,4 +627,6 @@ Actual negotiated rate depends on the peer and cable. Recovery allows Ethernet i
 | [OpenWrt PR #21586: Askey SBE1V1K support](https://github.com/openwrt/openwrt/pull/21586) | Board DTS, Ethernet port and PHY topology, factory/mainline partition geometry, boot environment behavior, and OpenWrt image definitions |
 | [OpenWrt PR #24033: IPQ9574 USXGMII fixes](https://github.com/openwrt/openwrt/pull/24033) | Public IPQ9574 PCS/UNIPHY mode programming, reset and clock sequencing, and USXGMII in-band autonegotiation |
 | [Linux upstream QCA808x PHY driver](https://github.com/torvalds/linux/blob/master/drivers/net/phy/qcom/qca808x.c) | QCA8081 2.5G advertisement and SerDes FIFO link-state handling |
+| [YYH2913/http-uboot](https://github.com/YYH2913/http-uboot) | The SBE1V1K chainloader, HTTP recovery, layout migration, and NSS/PPE networking this fork builds on |
+| [James Hilliard: "net: share the lwIP runtime and support netconsole" (v2)](https://patchwork.ozlabs.org/project/uboot/list/?series=521255) | Shared lwIP runtime and the lwIP netconsole transport, applied here before upstream review completes |
 | [OpenWrt commit `6369c9e5c799`: Realtek 5G/10G PHY support](https://github.com/openwrt/openwrt/commit/6369c9e5c79994c380d0c63cfb003c935a974332) | Public RTL8261BE/RTL8261N identification, initialization patch engine, firmware-table handling, and link status logic |
