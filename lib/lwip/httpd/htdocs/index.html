@@ -623,6 +623,7 @@ var selectedUploadFormat="raw";
 var selectedUploadProfile="";
 var fileInspection=0;
 var activeDiskLayout="unknown";
+var qsdkSourceNote="This QSDK GPT is normalised first: 0:WIFIFW moves from LBA 40482 to 40994 (a verified copy also fills 0:WIFIFW_1), and 0:LICENSE, 0:HLOS and 0:HLOS_1 are recreated empty. P1-P21 are preserved. ";
 var firmwareKernelPad=32*1024*1024;
 var firmwareMax=1024*1024*1024;
 var firmwareLocked=false;
@@ -901,7 +902,7 @@ function setQwrtVisibility(unlocked){
 }
 
 function configureActiveLayout(layout,kernelPad,maxSize,locked,unlocked){
-  activeDiskLayout=(layout==="mainline"||layout==="large"||layout==="qwrt")?layout:(layout==="factory"?"factory":"unknown");
+  activeDiskLayout=(layout==="mainline"||layout==="large"||layout==="qwrt")?layout:(layout==="factory"||layout==="qsdk"?layout:"unknown");
   setQwrtVisibility(unlocked);
   firmwareLocked=!!locked||(layout==="qwrt"&&!qwrtUnlocked);
   firmwareKernelPad=kernelPad||32*1024*1024;
@@ -926,7 +927,9 @@ function configureActiveLayout(layout,kernelPad,maxSize,locked,unlocked){
     profiles.firmware.warning="Firmware writes are disabled on this pre-migration factory GPT.";
     profiles.firmware.note="The factory partition tail has not been accepted as a firmware target.";
     profiles.uboot.target=layout==="factory"?"rsvd_2":"Unavailable";
-    profiles.uboot.warning=layout==="factory"?"rsvd_2 is erased before writing. A failed transfer can break recovery boot.":"The chainloader target is unavailable until the partition map is identified.";
+    profiles.uboot.warning=layout==="factory"?"rsvd_2 is erased before writing. A failed transfer can break recovery boot.":
+      layout==="qsdk"?"This QSDK GPT has no chainloader partition. Migrate the eMMC layout first; it installs the running chainloader.":
+      "The chainloader target is unavailable until the partition map is identified.";
     if(selectedFile)validateFile();
     return;
   }
@@ -953,7 +956,7 @@ function configureActiveLayout(layout,kernelPad,maxSize,locked,unlocked){
 
 function updateLayoutSelection(){
   var selected=layoutProfiles[layoutSelect.value]||layoutProfiles.large;
-  document.getElementById("layout-copy").textContent=selected.copy;
+  document.getElementById("layout-copy").textContent=(activeDiskLayout==="qsdk"?qsdkSourceNote:"")+selected.copy;
   document.getElementById("layout-help").textContent=selected.help;
   document.getElementById("layout-warning-title").textContent=selected.warningTitle;
   var layoutWarningCopy=document.getElementById("layout-warning-copy");

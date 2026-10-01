@@ -499,6 +499,8 @@ static enum recovery_sbe1v1k_layout active_sbe1v1k_layout =
 	RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
 /* A recognised factory GPT is safe to migrate, but not safe to flash in place. */
 static bool sbe1v1k_factory_pre_migration;
+/* The pre-migration GPT is the QSDK source variant (see sbe1v1k_qsdk_tail). */
+static bool sbe1v1k_qsdk_pre_migration;
 
 /* QWRT is an explicit, session-only capability. */
 static bool qwrt_button_unlocked;
@@ -3583,6 +3585,45 @@ static const struct recovery_sbe1v1k_gpt_part sbe1v1k_mainline_tail[] = {
 	{ "ASKEYMFC", 15249408, 0, "D45FCE56-5F25-410E-B914-87CB2C8318F4" },
 };
 
+/*
+ * Another Spectrum QSDK GPT shares P1-P21 with the factory map, but has no
+ * 0:LICENSE/0:WIFIFW_1, packs 0:WIFIFW directly after 0:ETHPHYFW and uses a
+ * different OS tail.  Migration normalises it to the factory P1-P26 prefix:
+ * 0:WIFIFW is moved 512 blocks up and the remaining prefix slots are created.
+ */
+#define RECOVERY_SBE1V1K_COMMON_PARTS 21
+#define RECOVERY_SBE1V1K_LICENSE_IDX  21U
+#define RECOVERY_SBE1V1K_WIFIFW_IDX   22U
+#define RECOVERY_SBE1V1K_WIFIFW_1_IDX 23U
+#define RECOVERY_SBE1V1K_HLOS_IDX     24U
+#define RECOVERY_SBE1V1K_QSDK_WIFIFW_P 22
+#define RECOVERY_SBE1V1K_QSDK_HLOS_P   25
+
+static const struct recovery_factory_part sbe1v1k_qsdk_tail[] = {
+	{ "0:WIFIFW", 40482, 20480 },
+	{ "kernel_bak", 60962, 30720 },
+	{ "rootfs_bak", 91682, 204800 },
+	{ "0:HLOS", 296482, 30720 },
+	{ "rootfs", 327202, 3145728 },
+	{ "rootfs_data", 3472930, 3145728 },
+	{ "user_data", 6618658, 8153088 },
+};
+
+/*
+ * Staging marker written into the future 0:HLOS_1 slot once the source
+ * 0:WIFIFW has been copied into the future 0:WIFIFW_1 slot.  The source copy
+ * is overwritten by the move, so a retried migration must resume from the
+ * staged copy instead of re-reading the (partially moved) source.
+ */
+#define RECOVERY_SBE1V1K_WIFIFW_STAGE_MAGIC "SBE1V1K-WIFIFW-STAGE-1"
+
+struct recovery_sbe1v1k_wififw_stage {
+	char magic[32];
+	u32 blocks;
+	u32 data_crc;
+	u32 marker_crc;
+};
+
 static const struct recovery_sbe1v1k_layout_desc *
 recovery_sbe1v1k_layout_desc(enum recovery_sbe1v1k_layout layout)
 {
@@ -3707,15 +3748,10 @@ static int recovery_get_mmc_disk_guid(char *buf, size_t size)
 	return 0;
 }
 
-static int recovery_check_sbe1v1k_prefix(struct blk_desc **descp,
-					  bool *has_hlos_1p)
+static int recovery_sbe1v1k_user_desc(struct blk_desc **descp)
 {
 	struct blk_desc *desc;
-	struct disk_partition part;
-	size_t prefix_count = 0;
-	size_t i;
 	int ret;
-	int p;
 
 	ret = blk_get_device_by_str("mmc", recovery_mmcdev(), &desc);
 	if (ret < 0)
@@ -3728,6 +3764,75 @@ static int recovery_check_sbe1v1k_prefix(struct blk_desc **descp,
 		       desc->blksz);
 		return -EINVAL;
 	}
+
+	*descp = desc;
+	return 0;
+}
+
+static int recovery_match_sbe1v1k_parts(struct blk_desc *desc, int first,
+					const struct recovery_factory_part *expect,
+					size_t count)
+{
+	struct disk_partition part;
+	size_t i;
+	int ret;
+
+	for (i = 0; i < count; i++) {
+		ret = part_get_info(desc, first + (int)i, &part);
+		if (ret || strcmp((const char *)part.name, expect[i].name) ||
+		    part.start != expect[i].start ||
+		    part.size != expect[i].size)
+			return ret ?: -EINVAL;
+	}
+
+	return 0;
+}
+
+/* Match the QSDK source GPT exactly, including the absence of extra entries. */
+static int recovery_check_sbe1v1k_qsdk_source(struct blk_desc **descp)
+{
+	const int tail_first = RECOVERY_SBE1V1K_COMMON_PARTS + 1;
+	const int next = tail_first + (int)ARRAY_SIZE(sbe1v1k_qsdk_tail);
+	struct disk_partition part;
+	struct blk_desc *desc;
+	int ret;
+	int p;
+
+	ret = recovery_sbe1v1k_user_desc(&desc);
+	if (ret)
+		return ret;
+
+	ret = recovery_match_sbe1v1k_parts(desc, 1, sbe1v1k_factory_parts,
+					   RECOVERY_SBE1V1K_COMMON_PARTS);
+	ret = ret ?: recovery_match_sbe1v1k_parts(desc, tail_first,
+						  sbe1v1k_qsdk_tail,
+						  ARRAY_SIZE(sbe1v1k_qsdk_tail));
+	if (ret)
+		return ret;
+
+	for (p = next; p <= MAX_SEARCH_PARTITIONS; p++) {
+		if (!part_get_info(desc, p, &part))
+			return -EINVAL;
+	}
+
+	if (descp)
+		*descp = desc;
+	return 0;
+}
+
+static int recovery_check_sbe1v1k_prefix(struct blk_desc **descp,
+					  bool *has_hlos_1p)
+{
+	struct blk_desc *desc;
+	struct disk_partition part;
+	size_t prefix_count = 0;
+	size_t i;
+	int ret;
+	int p;
+
+	ret = recovery_sbe1v1k_user_desc(&desc);
+	if (ret)
+		return ret;
 
 	for (p = 1; p <= MAX_SEARCH_PARTITIONS; p++) {
 		ret = part_get_info(desc, p, &part);
@@ -3788,8 +3893,90 @@ static int recovery_check_sbe1v1k_prefix(struct blk_desc **descp,
 	return 0;
 }
 
+/*
+ * gpt write rejects an oversized table itself, but the QSDK normalisation
+ * moves data before the GPT is written, so check the target geometry first.
+ */
+static int recovery_check_sbe1v1k_fits(struct blk_desc *desc, const char *name,
+				       lbaint_t start, lbaint_t min_size)
+{
+	/* The secondary GPT uses the final header block and 32 entry blocks. */
+	lbaint_t last_usable = desc->lba > 34 ? desc->lba - 34 : 0;
+
+	if (start > last_usable || min_size > last_usable - start + 1) {
+		printf("SBE1V1K target partition '%s' at LBA " LBAF
+		       " does not fit this eMMC (last usable LBA " LBAF ")\n",
+		       name, start, last_usable);
+		return -ENOSPC;
+	}
+
+	return 0;
+}
+
+/* Re-emit an existing partition's GUIDs at a factory prefix slot. */
+static int recovery_append_sbe1v1k_slot(char *gpt, size_t *offp,
+					const struct disk_partition *src,
+					size_t slot, bool keep_uuid)
+{
+	const struct recovery_factory_part *dst = &sbe1v1k_factory_parts[slot];
+	struct disk_partition part = *src;
+
+	strlcpy((char *)part.name, dst->name, sizeof(part.name));
+	part.start = dst->start;
+	part.size = dst->size;
+	part.bootable = 0;
+	if (!keep_uuid)
+		disk_partition_clr_uuid(&part);
+
+	return recovery_append_existing_gpt_part(gpt, RECOVERY_SBE1V1K_GPT_MAX,
+						 offp, &part);
+}
+
+static int recovery_append_sbe1v1k_qsdk_prefix(char *gpt, size_t *offp,
+					       struct blk_desc *desc)
+{
+	const struct recovery_factory_part *license =
+		&sbe1v1k_factory_parts[RECOVERY_SBE1V1K_LICENSE_IDX];
+	struct disk_partition wififw;
+	struct disk_partition hlos;
+	struct disk_partition part;
+	int ret;
+	int p;
+
+	for (p = 1; p <= RECOVERY_SBE1V1K_COMMON_PARTS; p++) {
+		ret = part_get_info(desc, p, &part);
+		ret = ret ?: recovery_append_existing_gpt_part(gpt,
+						RECOVERY_SBE1V1K_GPT_MAX,
+						offp, &part);
+		if (ret)
+			return ret;
+	}
+
+	ret = part_get_info(desc, RECOVERY_SBE1V1K_QSDK_WIFIFW_P, &wififw);
+	ret = ret ?: part_get_info(desc, RECOVERY_SBE1V1K_QSDK_HLOS_P, &hlos);
+	if (ret)
+		return ret;
+
+	ret = recovery_append_gpt_part(gpt, RECOVERY_SBE1V1K_GPT_MAX, offp,
+				       license->name, license->start,
+				       license->size, desc->blksz,
+				       RECOVERY_GPT_TYPE_BASIC_DATA, NULL,
+				       false);
+	ret = ret ?: recovery_append_sbe1v1k_slot(gpt, offp, &wififw,
+						  RECOVERY_SBE1V1K_WIFIFW_IDX,
+						  true);
+	ret = ret ?: recovery_append_sbe1v1k_slot(gpt, offp, &wififw,
+						  RECOVERY_SBE1V1K_WIFIFW_1_IDX,
+						  false);
+	ret = ret ?: recovery_append_sbe1v1k_slot(gpt, offp, &hlos,
+						  RECOVERY_SBE1V1K_HLOS_IDX,
+						  true);
+	return ret;
+}
+
 static int recovery_build_sbe1v1k_gpt(
-	const struct recovery_sbe1v1k_layout_desc *layout, char **gptp)
+	const struct recovery_sbe1v1k_layout_desc *layout, bool qsdk_source,
+	char **gptp)
 {
 	char disk_guid[UUID_STR_LEN + 1];
 	struct blk_desc *desc;
@@ -3800,7 +3987,10 @@ static int recovery_build_sbe1v1k_gpt(
 	int ret;
 	int p;
 
-	ret = recovery_check_sbe1v1k_prefix(&desc, &has_hlos_1);
+	if (qsdk_source)
+		ret = recovery_check_sbe1v1k_qsdk_source(&desc);
+	else
+		ret = recovery_check_sbe1v1k_prefix(&desc, &has_hlos_1);
 	if (ret)
 		return ret;
 
@@ -3818,7 +4008,7 @@ static int recovery_build_sbe1v1k_gpt(
 	if (ret)
 		goto err;
 
-	for (p = 1; p <= MAX_SEARCH_PARTITIONS; p++) {
+	for (p = 1; !qsdk_source && p <= MAX_SEARCH_PARTITIONS; p++) {
 		struct disk_partition part;
 		lbaint_t end;
 
@@ -3850,6 +4040,13 @@ static int recovery_build_sbe1v1k_gpt(
 		preserved++;
 	}
 
+	if (qsdk_source) {
+		ret = recovery_append_sbe1v1k_qsdk_prefix(gpt, &off, desc);
+		if (ret)
+			goto err;
+		preserved = ARRAY_SIZE(sbe1v1k_factory_parts);
+	}
+
 	if (preserved != ARRAY_SIZE(sbe1v1k_factory_parts) + has_hlos_1) {
 		printf("SBE1V1K prefix changed while building the target GPT\n");
 		ret = -EINVAL;
@@ -3874,6 +4071,12 @@ static int recovery_build_sbe1v1k_gpt(
 			const struct recovery_sbe1v1k_gpt_part *part =
 				&sbe1v1k_mainline_tail[i];
 
+			ret = recovery_check_sbe1v1k_fits(desc, part->name,
+							  part->start,
+							  part->size ?: 1);
+			if (ret)
+				goto err;
+
 			ret = recovery_append_gpt_part(gpt,
 						       RECOVERY_SBE1V1K_GPT_MAX,
 						       &off, part->name,
@@ -3884,6 +4087,12 @@ static int recovery_build_sbe1v1k_gpt(
 				goto err;
 		}
 	} else {
+		/* recovery_verify_sbe1v1k_gpt() requires at least 512 MiB of data. */
+		ret = recovery_check_sbe1v1k_fits(desc, "rootfs_data",
+						  layout->data_start, 1048576);
+		if (ret)
+			goto err;
+
 		ret = recovery_append_gpt_part(gpt,
 					       RECOVERY_SBE1V1K_GPT_MAX, &off,
 					       "chainloader", layout->uboot_start,
@@ -3933,7 +4142,8 @@ err:
 }
 
 static int recovery_verify_factory_gpt(
-	struct recovery_status_led_ctrl *status_leds, bool *has_hlos_1p)
+	struct recovery_status_led_ctrl *status_leds, bool *has_hlos_1p,
+	bool *qsdk_sourcep)
 {
 	int ret;
 
@@ -3945,7 +4155,14 @@ static int recovery_verify_factory_gpt(
 	prog_total = prog_erase_total;
 	prog_done = 0;
 
+	*qsdk_sourcep = false;
 	ret = recovery_check_sbe1v1k_prefix(NULL, has_hlos_1p);
+	if (ret && !recovery_check_sbe1v1k_qsdk_source(NULL)) {
+		printf("SBE1V1K QSDK source GPT recognised; P22-P26 will be normalised to the factory prefix\n");
+		*has_hlos_1p = false;
+		*qsdk_sourcep = true;
+		ret = 0;
+	}
 	if (ret)
 		return ret;
 
@@ -3956,16 +4173,118 @@ static int recovery_verify_factory_gpt(
 	return 0;
 }
 
-static int recovery_clone_sbe1v1k_hlos_1(
-	struct recovery_status_led_ctrl *status_leds, size_t progress_base)
+/*
+ * Copy @count blocks from @src to @dst, or zero-fill @dst when @zero is set,
+ * reading every chunk back before continuing.  Source and destination must
+ * not overlap.  @crcp, when non-NULL, accumulates a CRC32 of the written data.
+ */
+static int recovery_sbe1v1k_copy_blocks(struct blk_desc *desc, lbaint_t src,
+					lbaint_t dst, lbaint_t count, bool zero,
+					const char *what, u32 *crcp,
+					struct recovery_status_led_ctrl *status_leds,
+					size_t *progressp)
 {
-	struct disk_partition hlos;
-	struct blk_desc *desc;
 	lbaint_t chunk_blocks;
 	lbaint_t copied = 0;
 	ulong chunk_size;
 	u8 *source_buf;
 	u8 *verify_buf;
+	int ret;
+
+	chunk_size = ALIGN(RECOVERY_MMC_WRITE_CHUNK, desc->blksz);
+	chunk_blocks = chunk_size / desc->blksz;
+	source_buf = memalign(ARCH_DMA_MINALIGN, chunk_size);
+	verify_buf = memalign(ARCH_DMA_MINALIGN, chunk_size);
+	if (!source_buf || !verify_buf) {
+		free(source_buf);
+		free(verify_buf);
+		return -ENOMEM;
+	}
+	if (zero)
+		memset(source_buf, 0, chunk_size);
+
+	while (copied < count) {
+		lbaint_t todo = count - copied;
+		size_t bytes;
+
+		if (todo > chunk_blocks)
+			todo = chunk_blocks;
+		bytes = todo * desc->blksz;
+		if (!zero &&
+		    blk_dread(desc, src + copied, todo, source_buf) != todo) {
+			printf("Failed to read the source data for %s\n", what);
+			ret = -EIO;
+			goto out;
+		}
+		if (blk_dwrite(desc, dst + copied, todo, source_buf) != todo) {
+			printf("Failed to write %s\n", what);
+			ret = -EIO;
+			goto out;
+		}
+		memset(verify_buf, 0xa5, bytes);
+		if (blk_dread(desc, dst + copied, todo, verify_buf) != todo ||
+		    memcmp(source_buf, verify_buf, bytes)) {
+			printf("%s read-back verification failed\n", what);
+			ret = -EIO;
+			goto out;
+		}
+		if (crcp)
+			*crcp = crc32(*crcp, source_buf, bytes);
+
+		copied += todo;
+		prog_write_done = *progressp + (size_t)copied * desc->blksz;
+		prog_done = prog_erase_done + prog_write_done;
+		recovery_service_runtime(status_leds);
+	}
+
+	*progressp += (size_t)count * desc->blksz;
+	ret = 0;
+
+out:
+	free(source_buf);
+	free(verify_buf);
+	return ret;
+}
+
+static int recovery_sbe1v1k_crc_blocks(struct blk_desc *desc, lbaint_t start,
+				       lbaint_t count, u32 *crcp)
+{
+	lbaint_t chunk_blocks;
+	lbaint_t done = 0;
+	ulong chunk_size;
+	u8 *buf;
+	int ret = 0;
+
+	chunk_size = ALIGN(RECOVERY_MMC_WRITE_CHUNK, desc->blksz);
+	chunk_blocks = chunk_size / desc->blksz;
+	buf = memalign(ARCH_DMA_MINALIGN, chunk_size);
+	if (!buf)
+		return -ENOMEM;
+
+	*crcp = 0;
+	while (done < count) {
+		lbaint_t todo = count - done;
+
+		if (todo > chunk_blocks)
+			todo = chunk_blocks;
+		if (blk_dread(desc, start + done, todo, buf) != todo) {
+			ret = -EIO;
+			break;
+		}
+		*crcp = crc32(*crcp, buf, todo * desc->blksz);
+		done += todo;
+	}
+
+	free(buf);
+	return ret;
+}
+
+static int recovery_clone_sbe1v1k_hlos_1(
+	struct recovery_status_led_ctrl *status_leds, size_t progress_base)
+{
+	struct disk_partition hlos;
+	struct blk_desc *desc;
+	size_t progress = progress_base;
 	int ret;
 
 	ret = recovery_get_mmc_part("0#0:HLOS", &desc, &hlos);
@@ -3978,54 +4297,178 @@ static int recovery_clone_sbe1v1k_hlos_1(
 		return -EINVAL;
 	}
 
-	chunk_size = ALIGN(RECOVERY_MMC_WRITE_CHUNK, desc->blksz);
-	chunk_blocks = chunk_size / desc->blksz;
-	source_buf = memalign(ARCH_DMA_MINALIGN, chunk_size);
-	verify_buf = memalign(ARCH_DMA_MINALIGN, chunk_size);
-	if (!source_buf || !verify_buf) {
-		free(source_buf);
-		free(verify_buf);
-		return -ENOMEM;
-	}
-
-	while (copied < hlos.size) {
-		lbaint_t todo = hlos.size - copied;
-
-		if (todo > chunk_blocks)
-			todo = chunk_blocks;
-		if (blk_dread(desc, hlos.start + copied, todo, source_buf) != todo) {
-			printf("Failed to read 0:HLOS while creating 0:HLOS_1\n");
-			ret = -EIO;
-			goto out;
-		}
-		if (blk_dwrite(desc, RECOVERY_SBE1V1K_HLOS_1_START + copied,
-			       todo, source_buf) != todo) {
-			printf("Failed to write the new 0:HLOS_1 data\n");
-			ret = -EIO;
-			goto out;
-		}
-		memset(verify_buf, 0, todo * desc->blksz);
-		if (blk_dread(desc, RECOVERY_SBE1V1K_HLOS_1_START + copied,
-			      todo, verify_buf) != todo ||
-		    memcmp(source_buf, verify_buf, todo * desc->blksz)) {
-			printf("0:HLOS_1 read-back verification failed\n");
-			ret = -EIO;
-			goto out;
-		}
-
-		copied += todo;
-		prog_write_done = progress_base + (size_t)copied * desc->blksz;
-		prog_done = prog_erase_done + prog_write_done;
-		recovery_service_runtime(status_leds);
-	}
+	ret = recovery_sbe1v1k_copy_blocks(desc, hlos.start,
+					   RECOVERY_SBE1V1K_HLOS_1_START,
+					   hlos.size, false, "0:HLOS_1", NULL,
+					   status_leds, &progress);
+	if (ret)
+		return ret;
 
 	recovery_debug_printf("Cloned 0:HLOS into the missing 0:HLOS_1 slot\n");
-	ret = 0;
+	return 0;
+}
+
+static u32 recovery_sbe1v1k_wififw_stage_crc(
+	const struct recovery_sbe1v1k_wififw_stage *stage)
+{
+	return crc32(0, (const u8 *)stage,
+		     offsetof(struct recovery_sbe1v1k_wififw_stage, marker_crc));
+}
+
+/* Returns 0 with *stagedp set when a valid staged 0:WIFIFW copy exists. */
+static int recovery_read_sbe1v1k_wififw_stage(struct blk_desc *desc,
+					      u8 *block, bool *stagedp)
+{
+	const struct recovery_factory_part *wififw =
+		&sbe1v1k_factory_parts[RECOVERY_SBE1V1K_WIFIFW_IDX];
+	const struct recovery_factory_part *wififw_1 =
+		&sbe1v1k_factory_parts[RECOVERY_SBE1V1K_WIFIFW_1_IDX];
+	struct recovery_sbe1v1k_wififw_stage stage;
+	u32 crc;
+	int ret;
+
+	*stagedp = false;
+	if (blk_dread(desc, RECOVERY_SBE1V1K_HLOS_1_START, 1, block) != 1)
+		return -EIO;
+
+	memcpy(&stage, block, sizeof(stage));
+	if (strncmp(stage.magic, RECOVERY_SBE1V1K_WIFIFW_STAGE_MAGIC,
+		    sizeof(stage.magic)) ||
+	    stage.marker_crc != recovery_sbe1v1k_wififw_stage_crc(&stage) ||
+	    stage.blocks != wififw->size)
+		return 0;
+
+	ret = recovery_sbe1v1k_crc_blocks(desc, wififw_1->start, wififw_1->size,
+					  &crc);
+	if (ret)
+		return ret;
+	if (crc != stage.data_crc) {
+		printf("Staged 0:WIFIFW copy at LBA " LBAF " is damaged; restore 0:WIFIFW from a backup\n",
+		       (lbaint_t)wififw_1->start);
+		return -EIO;
+	}
+
+	*stagedp = true;
+	return 0;
+}
+
+/*
+ * Move the QSDK 0:WIFIFW (LBA 40482) to the factory slot (LBA 40994).  The
+ * two ranges overlap, so the data is first copied into the future 0:WIFIFW_1
+ * slot and a CRC-protected marker is written into the future 0:HLOS_1 slot.
+ * Both slots lie in the replaceable QSDK kernel_bak/rootfs_bak area.  Once
+ * the marker exists, a retried migration resumes from the staged copy
+ * because the source may already be partially overwritten.
+ */
+static int recovery_move_sbe1v1k_qsdk_wififw(
+	struct recovery_status_led_ctrl *status_leds, size_t *progressp)
+{
+	const struct recovery_factory_part *src = &sbe1v1k_qsdk_tail[0];
+	const struct recovery_factory_part *wififw =
+		&sbe1v1k_factory_parts[RECOVERY_SBE1V1K_WIFIFW_IDX];
+	const struct recovery_factory_part *wififw_1 =
+		&sbe1v1k_factory_parts[RECOVERY_SBE1V1K_WIFIFW_1_IDX];
+	struct recovery_sbe1v1k_wififw_stage stage;
+	struct blk_desc *desc;
+	bool staged;
+	u8 *block;
+	u32 crc = 0;
+	int ret;
+
+	ret = recovery_check_sbe1v1k_qsdk_source(&desc);
+	if (ret)
+		return ret;
+
+	block = memalign(ARCH_DMA_MINALIGN, desc->blksz);
+	if (!block)
+		return -ENOMEM;
+
+	ret = recovery_read_sbe1v1k_wififw_stage(desc, block, &staged);
+	if (ret)
+		goto out;
+
+	if (staged) {
+		printf("Resuming 0:WIFIFW relocation from the staged copy\n");
+		*progressp += (size_t)wififw_1->size * desc->blksz;
+	} else {
+		ret = recovery_sbe1v1k_copy_blocks(desc, src->start,
+						   wififw_1->start, src->size,
+						   false, "staged 0:WIFIFW copy",
+						   &crc, status_leds, progressp);
+		if (ret)
+			goto out;
+
+		memset(&stage, 0, sizeof(stage));
+		strlcpy(stage.magic, RECOVERY_SBE1V1K_WIFIFW_STAGE_MAGIC,
+			sizeof(stage.magic));
+		stage.blocks = src->size;
+		stage.data_crc = crc;
+		stage.marker_crc = recovery_sbe1v1k_wififw_stage_crc(&stage);
+		memset(block, 0, desc->blksz);
+		memcpy(block, &stage, sizeof(stage));
+		if (blk_dwrite(desc, RECOVERY_SBE1V1K_HLOS_1_START, 1,
+			       block) != 1) {
+			printf("Failed to write the 0:WIFIFW staging marker\n");
+			ret = -EIO;
+			goto out;
+		}
+		ret = recovery_read_sbe1v1k_wififw_stage(desc, block, &staged);
+		if (!ret && !staged)
+			ret = -EIO;
+		if (ret) {
+			printf("0:WIFIFW staging marker verification failed\n");
+			goto out;
+		}
+	}
+
+	ret = recovery_sbe1v1k_copy_blocks(desc, wififw_1->start,
+					   wififw->start, wififw->size, false,
+					   "relocated 0:WIFIFW", NULL,
+					   status_leds, progressp);
+	if (ret)
+		goto out;
+
+	recovery_debug_printf("Moved 0:WIFIFW from LBA " LBAF " to LBA " LBAF
+			      " and filled 0:WIFIFW_1\n",
+			      (lbaint_t)src->start, (lbaint_t)wififw->start);
 
 out:
-	free(source_buf);
-	free(verify_buf);
+	free(block);
 	return ret;
+}
+
+/* Clear the new prefix slots, including the staging marker in 0:HLOS_1. */
+static int recovery_clear_sbe1v1k_qsdk_slots(
+	struct recovery_status_led_ctrl *status_leds, size_t *progressp)
+{
+	static const size_t slots[] = {
+		RECOVERY_SBE1V1K_LICENSE_IDX,
+		RECOVERY_SBE1V1K_HLOS_IDX,
+	};
+	struct blk_desc *desc;
+	size_t i;
+	int ret;
+
+	ret = recovery_sbe1v1k_user_desc(&desc);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ARRAY_SIZE(slots); i++) {
+		const struct recovery_factory_part *part =
+			&sbe1v1k_factory_parts[slots[i]];
+
+		ret = recovery_sbe1v1k_copy_blocks(desc, 0, part->start,
+						   part->size, true, part->name,
+						   NULL, status_leds, progressp);
+		if (ret)
+			return ret;
+	}
+
+	return recovery_sbe1v1k_copy_blocks(desc, 0,
+					    RECOVERY_SBE1V1K_HLOS_1_START,
+					    RECOVERY_SBE1V1K_HLOS_1_SIZE, true,
+					    "0:HLOS_1", NULL, status_leds,
+					    progressp);
 }
 
 /*
@@ -4155,15 +4598,17 @@ static int recovery_apply_sbe1v1k_layout(
 
 	active_sbe1v1k_layout = layout->id;
 	sbe1v1k_factory_pre_migration = false;
+	sbe1v1k_qsdk_pre_migration = false;
 	recovery_debug_printf("SBE1V1K partition profile: %s\n", layout->name);
 	return 0;
 }
 
-static int recovery_apply_sbe1v1k_factory_recovery(void)
+static int recovery_apply_sbe1v1k_factory_recovery(bool qsdk_source)
 {
 	int ret;
 
-	ret = env_set("recovery_part_uboot",
+	/* The QSDK source GPT has neither rsvd_2 nor a chainloader partition. */
+	ret = env_set("recovery_part_uboot", qsdk_source ? NULL :
 		      RECOVERY_SBE1V1K_FACTORY_UBOOT_PART);
 	ret = ret ?: env_set("recovery_part_uboot_alt", NULL);
 	ret = ret ?: env_set("recovery_part_kernel", NULL);
@@ -4175,17 +4620,26 @@ static int recovery_apply_sbe1v1k_factory_recovery(void)
 
 	active_sbe1v1k_layout = RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
 	sbe1v1k_factory_pre_migration = true;
-	printf("SBE1V1K factory GPT recognised: chainloader target is rsvd_2; migrate the layout before uploading firmware\n");
+	sbe1v1k_qsdk_pre_migration = qsdk_source;
+	if (qsdk_source)
+		printf("SBE1V1K QSDK source GPT recognised: no chainloader partition; migrate the layout before uploading firmware\n");
+	else
+		printf("SBE1V1K factory GPT recognised: chainloader target is rsvd_2; migrate the layout before uploading firmware\n");
 	return 0;
 }
 
 static int recovery_detect_sbe1v1k_layout(void)
 {
 	sbe1v1k_factory_pre_migration = false;
+	sbe1v1k_qsdk_pre_migration = false;
+	/* The QSDK source signature is exact, so it cannot shadow other maps. */
+	if (!recovery_check_sbe1v1k_qsdk_source(NULL))
+		return recovery_apply_sbe1v1k_factory_recovery(true);
+
 	/* Avoid probing a non-existent large-layout chainloader on factory GPTs. */
 	if (recovery_sbe1v1k_hlos_1_missing() &&
 	    !recovery_verify_sbe1v1k_factory_boot_path())
-		return recovery_apply_sbe1v1k_factory_recovery();
+		return recovery_apply_sbe1v1k_factory_recovery(false);
 
 	if (!recovery_verify_sbe1v1k_gpt(&sbe1v1k_layout_large, false)) {
 		/* QWRT is restricted to the factory-compatible geometry below. */
@@ -4999,10 +5453,13 @@ static int recovery_repartition_factory(
 	void *chainloader_fit;
 	size_t chainloader_size;
 	size_t hlos_clone_size;
+	size_t qsdk_move_size;
+	size_t qsdk_clear_size;
 	size_t write_progress;
-	char *repartition_gpt;
+	char *repartition_gpt = NULL;
 	u32 erase_progress_base;
 	bool has_hlos_1;
+	bool qsdk_source;
 	int ret;
 
 	if (!layout) {
@@ -5033,7 +5490,8 @@ static int recovery_repartition_factory(
 		}
 	}
 
-	ret = recovery_verify_factory_gpt(status_leds, &has_hlos_1);
+	ret = recovery_verify_factory_gpt(status_leds, &has_hlos_1,
+					  &qsdk_source);
 	if (ret)
 		return ret;
 
@@ -5045,6 +5503,11 @@ static int recovery_repartition_factory(
 	if (ret)
 		goto out;
 
+	/* Build (and size-check) the target GPT before any block is written. */
+	ret = recovery_build_sbe1v1k_gpt(layout, qsdk_source, &repartition_gpt);
+	if (ret)
+		goto out;
+
 	recovery_debug_printf("Factory anchors verified. Writing SBE1V1K '%s' GPT layout...\n",
 			      layout->name);
 	prog_phase = 2;
@@ -5052,16 +5515,27 @@ static int recovery_repartition_factory(
 	erase_progress_base = prog_erase_total;
 	prog_erase_total += RECOVERY_MMC_ERASE_PROGRESS_STEPS;
 	prog_write_done = 0;
-	hlos_clone_size = has_hlos_1 ? 0 :
+	hlos_clone_size = has_hlos_1 || qsdk_source ? 0 :
 		RECOVERY_SBE1V1K_HLOS_1_SIZE * 512ULL;
-	prog_write_total = hlos_clone_size + 2 + chainloader_size +
-		RECOVERY_APPSBLENV_SIZE;
+	qsdk_move_size = qsdk_source ?
+		2 * sbe1v1k_qsdk_tail[0].size * 512ULL : 0;
+	qsdk_clear_size = qsdk_source ?
+		(sbe1v1k_factory_parts[RECOVERY_SBE1V1K_LICENSE_IDX].size +
+		 RECOVERY_SBE1V1K_HLOS_SIZE + RECOVERY_SBE1V1K_HLOS_1_SIZE) *
+		512ULL : 0;
+	prog_write_total = hlos_clone_size + qsdk_move_size + 2 +
+		qsdk_clear_size + chainloader_size + RECOVERY_APPSBLENV_SIZE;
 	prog_total = prog_erase_total + prog_write_total;
 	prog_done = prog_erase_done;
 	recovery_service_runtime(status_leds);
 	write_progress = 0;
 
-	if (!has_hlos_1) {
+	if (qsdk_source) {
+		ret = recovery_move_sbe1v1k_qsdk_wififw(status_leds,
+							&write_progress);
+		if (ret)
+			goto out;
+	} else if (!has_hlos_1) {
 		ret = recovery_clone_sbe1v1k_hlos_1(status_leds,
 						       write_progress);
 		if (ret)
@@ -5069,12 +5543,7 @@ static int recovery_repartition_factory(
 		write_progress += hlos_clone_size;
 	}
 
-	ret = recovery_build_sbe1v1k_gpt(layout, &repartition_gpt);
-	if (ret)
-		goto out;
-
 	ret = env_set("sbe1v1k_repartition_gpt", repartition_gpt);
-	free(repartition_gpt);
 	if (ret)
 		goto out;
 	prog_write_done = write_progress + 1;
@@ -5105,6 +5574,16 @@ static int recovery_repartition_factory(
 	prog_write_done = write_progress + 2;
 	prog_done = prog_erase_done + prog_write_done;
 	recovery_service_runtime(status_leds);
+
+	if (qsdk_source) {
+		size_t clear_progress = write_progress + 2;
+
+		ret = recovery_clear_sbe1v1k_qsdk_slots(status_leds,
+							&clear_progress);
+		if (ret)
+			goto out;
+		write_progress += qsdk_clear_size;
+	}
 
 	prog_phase = 1;
 	ret = recovery_mmc_erase_part(layout->uboot_part,
@@ -5141,6 +5620,7 @@ static int recovery_repartition_factory(
 			      layout->name);
 
 out:
+	free(repartition_gpt);
 	free(chainloader_fit);
 	return ret;
 }
@@ -7184,8 +7664,8 @@ static int recovery_open_about(struct fs_file *file)
 	qwrt_unlocked = recovery_board_is_sbe1v1k() && qwrt_button_unlocked;
 
 	if (!layout && recovery_board_is_sbe1v1k()) {
-		layout_name = sbe1v1k_factory_pre_migration ? "factory" :
-			"unknown";
+		layout_name = sbe1v1k_qsdk_pre_migration ? "qsdk" :
+			sbe1v1k_factory_pre_migration ? "factory" : "unknown";
 		firmware_max = 0;
 		kernel_pad = 0;
 		rootarg = "";
